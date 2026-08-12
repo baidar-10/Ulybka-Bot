@@ -1,0 +1,66 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { config as loadEnv } from "dotenv";
+import { z } from "zod";
+
+const repoRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../../../.."
+);
+loadEnv({ path: path.join(repoRoot, ".env") });
+loadEnv(); // optional apps/bot/.env override
+
+const envSchema = z.object({
+  NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
+  PORT: z.coerce.number().default(3000),
+  DATABASE_URL: z
+    .string()
+    .default("postgres://ulybka:ulybka@localhost:5432/ulybka"),
+  OPENAI_API_KEY: z.string().min(1, "OPENAI_API_KEY is required"),
+  OPENAI_MODEL: z.string().default("gpt-4o-mini"),
+  TIMEZONE: z.string().default("Asia/Almaty"),
+  WHATSAPP_AUTH_DIR: z.string().default(path.join(repoRoot, "data/whatsapp-auth")),
+  WHATSAPP_PROVIDER: z.enum(["baileys", "green-api", "none"]).default("green-api"),
+  WHATSAPP_ENABLED: z
+    .string()
+    .default("true")
+    .transform((v) => v === "true" || v === "1"),
+  GREEN_API_URL: z.string().default("https://7201.api.green-api.com"),
+  GREEN_API_ID_INSTANCE: z.string().default(""),
+  GREEN_API_TOKEN_INSTANCE: z.string().default(""),
+  GOOGLE_APPLICATION_CREDENTIALS: z.string().optional(),
+  GOOGLE_CALENDAR_ID: z.string().optional(),
+  GOOGLE_OAUTH_CLIENT_ID: z.string().optional(),
+  GOOGLE_OAUTH_CLIENT_SECRET: z.string().optional(),
+  GOOGLE_OAUTH_TOKEN_PATH: z
+    .string()
+    .default(path.join(repoRoot, "secrets/google-oauth-token.json")),
+  GOOGLE_CALENDAR_ENABLED: z
+    .string()
+    .default("false")
+    .transform((v) => v === "true" || v === "1"),
+  CLINIC_NAME: z.string().default("Улыбка столицы"),
+  LOG_LEVEL: z.string().default("info"),
+});
+
+export type Env = z.infer<typeof envSchema>;
+
+function resolvePath(p?: string): string | undefined {
+  if (!p) return undefined;
+  return path.isAbsolute(p) ? p : path.resolve(repoRoot, p);
+}
+
+const parsed = envSchema.parse(process.env);
+
+export const env: Env = {
+  ...parsed,
+  GOOGLE_APPLICATION_CREDENTIALS: resolvePath(
+    parsed.GOOGLE_APPLICATION_CREDENTIALS
+  ),
+  GOOGLE_OAUTH_TOKEN_PATH: resolvePath(parsed.GOOGLE_OAUTH_TOKEN_PATH)!,
+  WHATSAPP_AUTH_DIR: path.isAbsolute(parsed.WHATSAPP_AUTH_DIR)
+    ? parsed.WHATSAPP_AUTH_DIR
+    : path.resolve(repoRoot, parsed.WHATSAPP_AUTH_DIR),
+};
+
+export { repoRoot };

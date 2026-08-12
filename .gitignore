@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+data/whatsapp-auth/*
+!data/whatsapp-auth/.gitkeep
+secrets/*
+!secrets/.gitkeep
+*.log
+.DS_Store
+coverage/
