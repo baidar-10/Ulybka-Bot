@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS doctors (
   id SERIAL PRIMARY KEY,
   full_name TEXT NOT NULL,
   specialization TEXT NOT NULL,
-  google_calendar_id TEXT,
   color TEXT,
   active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -43,7 +42,6 @@ CREATE TABLE IF NOT EXISTS appointments (
   status appointment_status NOT NULL DEFAULT 'booked',
   comment TEXT,
   source TEXT NOT NULL DEFAULT 'whatsapp_ai',
-  google_event_id TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   CHECK (ends_at > starts_at)

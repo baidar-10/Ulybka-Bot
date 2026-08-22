@@ -9,3 +9,5 @@ secrets/**
 .DS_Store
 coverage
 apps/bot/dist
+docs
+

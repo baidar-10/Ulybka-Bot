@@ -1,0 +1,2 @@
+ALTER TABLE doctors ADD COLUMN IF NOT EXISTS macdent_id TEXT;
+ALTER TABLE appointments ADD COLUMN IF NOT EXISTS macdent_zapis_id TEXT;

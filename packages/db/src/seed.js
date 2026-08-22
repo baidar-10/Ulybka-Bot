@@ -8,7 +8,7 @@ const databaseUrl =
 const doctors = [
   {
     full_name: "Абдикаримова Асель",
-    specialization: "Ортодонт",
+    specialization: "Ортодонт, терапевт",
     color: "#4A90D9",
     services: [
       { name: "Консультация ортодонта", duration_minutes: 30 },
@@ -39,7 +39,7 @@ const doctors = [
   },
   {
     full_name: "Абдикаримов Ержан",
-    specialization: "Стоматолог-терапевт",
+    specialization: "Терапевт, хирург, ортопед",
     color: "#2ECC71",
     services: [
       { name: "Первичная консультация", duration_minutes: 30 },
@@ -70,7 +70,7 @@ const doctors = [
   },
   {
     full_name: "Масенов Ансар Алмазович",
-    specialization: "Стоматолог-терапевт",
+    specialization: "Терапевт, хирург, ортопед",
     color: "#E67E22",
     services: [
       { name: "Консультация", duration_minutes: 30 },

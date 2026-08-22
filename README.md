@@ -1,40 +1,45 @@
 # AI-бот WhatsApp для клиники «Улыбка столицы»
 
-Бот отвечает пациентам в WhatsApp 24/7, консультирует по услугам, записывает / переносит / отменяет приёмы и сохраняет их в PostgreSQL + Google Calendar.
+Бот отвечает пациентам в WhatsApp 24/7, консультирует по услугам, записывает / переносит / отменяет приёмы и сохраняет их в PostgreSQL.
 
 ## Стек
 
 - Node.js + TypeScript + Fastify
 - PostgreSQL (источник правды по записям)
 - OpenAI (`gpt-4o-mini` + tool calling)
-- WhatsApp через Baileys (бесплатно, неофициально)
-- Google Calendar API (по календарю на врача)
+- WhatsApp через GREEN-API или Baileys
+- MacDent API (ключ клиники)
 
-## Google Calendar
+## MacDent
 
-Календарь клиники уже прописан в `.env` (`GOOGLE_CALENDAR_ID`).
+В `.env` укажите ключ из кабинета MacDent:
 
-### Быстрый доступ через OAuth (рекомендуется для старта)
+```env
+MACDENT_API_URL=https://api-developer.macdent.kz
+MACDENT_API_KEY=your_macdent_api_key
+```
 
-1. [Google Cloud Console](https://console.cloud.google.com/) → создайте проект
-2. Включите **Google Calendar API**
-3. APIs & Services → Credentials → Create Credentials → **OAuth client ID** → Application type: **Desktop app**
-4. Скопируйте Client ID и Client Secret в `.env`:
-   ```env
-   GOOGLE_OAUTH_CLIENT_ID=...
-   GOOGLE_OAUTH_CLIENT_SECRET=...
-   GOOGLE_CALENDAR_ENABLED=true
-   ```
-5. Выполните:
-   ```bash
-   npm run google:auth
-   ```
-   Войдите в Google-аккаунт владельца календаря. Скрипт создаст тестовое событие и сохранит токен в `secrets/google-oauth-token.json`.
-6. Перезапустите бота — новые записи из WhatsApp появятся в календаре.
+Пока ключ пустой, бот стартует без MacDent (`macdent: false` в `/health`). Если ключ задан, запись и слоты идут через API [документации MacDent](https://docs-developer.macdent.kz/methods).
 
-### Альтернатива: Service Account
+Используемые методы:
 
-Скачайте JSON ключ сервисного аккаунта в `secrets/google-service-account.json`, расшарьте календарь на email сервисного аккаунта с правом «Изменение событий».
+| Метод | Назначение |
+|-------|------------|
+| `doctor/find` | Список врачей (`id`, `name`, `filials`) |
+| `rasp/find` | Расписание врача на месяц (`perDayData` — интервалы по дням) |
+| `zapis/find` | Занятые приёмы (`start`/`end`, статус `2` / DECLINED не занимает слот) |
+| `doctor/get_free_time` | Запасной запрос свободных окон, если в `rasp` нет интервалов |
+| `schedule/get` | Второй запасной запрос свободных окон |
+| `patient/find` | Найти пациента по телефону |
+| `patient/add` | Создать пациента, если его ещё нет |
+| `zapis/add` | Создать запись (`doctor`, `rasp`, `patient`, `start`, `end`) |
+| `zapis/update` | Перенести запись |
+| `zapis/remove` | Удалить запись |
+| `zapis/set_status` | Отмена, если `zapis/remove` недоступен |
+
+`appointment.send` — это заявка в CRM (имя/телефон), не ячейка в таблице «Расписание». Бот пишет в расписание через `zapis`.
+
+PDF из папки `docs/` в образ Docker не копируются (см. `.dockerignore`).
 
 ## WhatsApp через GREEN-API (рекомендуется)
 
@@ -68,21 +73,16 @@ docker compose up -d --build
 docker compose logs -f bot
 ```
 
-При первом запуске в логах появится **QR-код**. На телефоне с номером клиники:
+При первом запуске Baileys в логах появится **QR-код**. На телефоне с номером клиники:
 
 WhatsApp → Связанные устройства → Привязать устройство → отсканировать QR.
 
 Сессия сохранится в `data/whatsapp-auth/` — повторный QR не нужен, пока не разлогинитесь.
 
-### 3. Проверка без WhatsApp
-
-В `.env` можно временно поставить `WHATSAPP_ENABLED=false`, затем:
+### 3. Проверка
 
 ```bash
 curl -s http://localhost:3000/health
-curl -s -X POST http://localhost:3000/chat \
-  -H 'content-type: application/json' \
-  -d '{"phone":"77001234567","text":"Здравствуйте, хочу записаться к ортодонту"}'
 ```
 
 ## Локальная разработка (без Docker для бота)
@@ -93,37 +93,12 @@ docker compose up -d postgres
 
 cp .env.example .env
 # DATABASE_URL=postgres://ulybka:ulybka@localhost:5432/ulybka
-# WHATSAPP_ENABLED=false для теста через /chat
 
 npm install
 npm run db:migrate
 npm run db:seed
 npm run dev
 ```
-
-## Google Calendar
-
-1. В Google Cloud создайте проект → включите **Google Calendar API**.
-2. Создайте **Service Account**, скачайте JSON-ключ в `secrets/google-service-account.json`.
-3. В Google Calendar создайте 3 календаря (по врачу) и расшарьте каждый на email service account с правом «Вносить изменения в события».
-4. Узнайте Calendar ID каждого календаря (Настройки календаря → Идентификатор) и пропишите в БД:
-
-```sql
-UPDATE doctors SET google_calendar_id = 'asel@group.calendar.google.com' WHERE full_name = 'Абдикаримова Асель';
-UPDATE doctors SET google_calendar_id = 'erzhan@group.calendar.google.com' WHERE full_name = 'Абдикаримов Ержан';
-UPDATE doctors SET google_calendar_id = 'ansar@group.calendar.google.com' WHERE full_name = 'Масенов Ансар Алмазович';
-```
-
-5. В `.env`:
-
-```env
-GOOGLE_CALENDAR_ENABLED=true
-GOOGLE_APPLICATION_CREDENTIALS=/secrets/google-service-account.json
-```
-
-В Docker путь уже смонтирован как `/secrets/...` — см. `docker-compose.yml`.
-
-Пока `GOOGLE_CALENDAR_ENABLED=false`, записи работают только в PostgreSQL.
 
 ## Расписание клиники
 
@@ -139,9 +114,6 @@ GOOGLE_APPLICATION_CREDENTIALS=/secrets/google-service-account.json
 | Метод | Путь | Описание |
 |-------|------|----------|
 | GET | `/health` | Healthcheck |
-| POST | `/chat` | Тестовый диалог `{ phone, text }` |
-| GET | `/doctors` | Список врачей |
-| GET | `/services?doctor_id=` | Список услуг |
 
 ## Управление записями в чате
 
@@ -160,16 +132,15 @@ GOOGLE_APPLICATION_CREDENTIALS=/secrets/google-service-account.json
 ## Структура
 
 ```
-apps/bot/          — Fastify + Baileys + OpenAI + booking
+apps/bot/          — Fastify + WhatsApp + OpenAI + booking
 packages/db/       — миграции и seed
 docker-compose.yml
-secrets/           — google-service-account.json (не в git)
 data/whatsapp-auth — сессия WhatsApp (не в git)
 ```
 
 ## Добавление врача / услуги
 
-Достаточно INSERT в таблицы `doctors` / `services` (и calendar id). Логику бота менять не нужно — GPT читает каталог через tools.
+Достаточно INSERT в таблицы `doctors` / `services`. Логику бота менять не нужно — GPT читает каталог через tools.
 
 Принудительно пересоздать каталог из seed (сотрёт записи!):
 

@@ -2,18 +2,20 @@ import Fastify from "fastify";
 import { env } from "./config/env.js";
 import { pool } from "./db/pool.js";
 import { BookingService } from "./booking/service.js";
-import { createGoogleCalendarClient } from "./calendar/google.js";
 import { DialogOrchestrator } from "./ai/orchestrator.js";
 import {
   createBaileysProvider,
   createNullWhatsAppProvider,
 } from "./whatsapp/baileys.js";
 import { createGreenApiProvider } from "./whatsapp/green-api.js";
-import { normalizePhone } from "./booking/service.js";
+import { createMacdentClient } from "./macdent/client.js";
+import { MacdentSchedule } from "./macdent/schedule.js";
 
 async function main() {
-  const calendar = createGoogleCalendarClient();
-  const booking = new BookingService(calendar);
+  const macdent = createMacdentClient();
+  const booking = new BookingService(
+    macdent.enabled ? new MacdentSchedule(macdent) : undefined
+  );
   const orchestrator = new DialogOrchestrator(booking);
 
   const whatsapp = !env.WHATSAPP_ENABLED || env.WHATSAPP_PROVIDER === "none"
@@ -37,32 +39,10 @@ async function main() {
     return {
       ok: true,
       clinic: env.CLINIC_NAME,
-      googleCalendar: calendar.enabled,
-      googleCalendarId: env.GOOGLE_CALENDAR_ID || null,
       whatsapp: env.WHATSAPP_ENABLED,
       provider: env.WHATSAPP_PROVIDER,
+      macdent: macdent.enabled,
     };
-  });
-
-  /** Local/dev chat endpoint to test without WhatsApp */
-  app.post<{
-    Body: { phone?: string; text?: string };
-  }>("/chat", async (req, reply) => {
-    const phone = normalizePhone(req.body?.phone || "77001112233");
-    const text = (req.body?.text || "").trim();
-    if (!text) {
-      return reply.code(400).send({ error: "text is required" });
-    }
-    const response = await orchestrator.handleMessage({ phone, text });
-    return { phone, response };
-  });
-
-  app.get("/doctors", async () => booking.listDoctors());
-  app.get("/services", async (req) => {
-    const doctorId = (req.query as { doctor_id?: string }).doctor_id;
-    return booking.listServices(
-      doctorId ? Number(doctorId) : undefined
-    );
   });
 
   const shutdown = async () => {

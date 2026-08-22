@@ -15,13 +15,16 @@ import {
   saveConversation,
 } from "../db/conversations.js";
 import type { ConversationMessage } from "../db/types.js";
+import { doctorDisplayName, nameTokens, normalizeName } from "../macdent/parse.js";
+import { formatDateInTz, formatTimeInTz, nextIsoDateForWeekday } from "../booking/slots.js";
 
 const tools: ChatCompletionTool[] = [
   {
     type: "function",
     function: {
       name: "list_doctors",
-      description: "Список активных врачей клиники",
+      description:
+        "Список всех врачей. Перед вопросом «какой врач» вызови этот метод и перечисли пациенту ВСЕХ из ответа, никого не пропускай.",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -45,7 +48,7 @@ const tools: ChatCompletionTool[] = [
     function: {
       name: "find_slots",
       description:
-        "Найти свободные слоты врача на дату YYYY-MM-DD для услуги. Не выдумывай слоты — только результат этой функции.",
+        "Проверка свободного времени врача на дату. После ответа предложи пациенту ОДНО время из suggested. Не перечисляй список слотов.",
       parameters: {
         type: "object",
         properties: {
@@ -53,7 +56,7 @@ const tools: ChatCompletionTool[] = [
           service_id: { type: "integer" },
           date: { type: "string", description: "YYYY-MM-DD" },
         },
-        required: ["doctor_id", "service_id", "date"],
+        required: ["doctor_id", "date"],
         additionalProperties: false,
       },
     },
@@ -63,11 +66,14 @@ const tools: ChatCompletionTool[] = [
     function: {
       name: "book_appointment",
       description:
-        "Создать запись. Вызывать ТОЛЬКО после явного подтверждения пациентом (да/подтверждаю), когда известны ФИО, врач, услуга, дата и время.",
+        "Создать запись. Вызывать ТОЛЬКО после явного подтверждения пациентом (да/подтверждаю), когда известны фамилия имя отчество, врач, услуга, дата и время.",
       parameters: {
         type: "object",
         properties: {
-          patient_name: { type: "string" },
+          patient_name: {
+            type: "string",
+            description: "Фамилия Имя Отчество пациента, как в документе",
+          },
           doctor_id: { type: "integer" },
           service_id: { type: "integer" },
           date: { type: "string", description: "YYYY-MM-DD" },
@@ -101,7 +107,8 @@ const tools: ChatCompletionTool[] = [
     type: "function",
     function: {
       name: "reschedule_appointment",
-      description: "Перенести существующую запись пациента на новую дату/время",
+      description:
+        "Перенести запись. Вызывать только когда пациент согласился на конкретное время. Не предлагай перенос сам и не показывай список слотов.",
       parameters: {
         type: "object",
         properties: {
@@ -144,60 +151,254 @@ function systemPrompt(): string {
     weekday: "long",
   }).format(new Date());
 
-  return `Ты — администратор записи клиники «${CLINIC.name}» в WhatsApp.
-Твоя ЕДИНСТВЕННАЯ цель: быстро довести человека до подтверждённой записи на приём.
-Ты не консультант по лечению и не справочник. Не читай лекции о зубах. Не перечисляй весь прайс.
+  const upcoming = [
+    `понедельник ${nextIsoDateForWeekday(1, CLINIC.timezone)}`,
+    `вторник ${nextIsoDateForWeekday(2, CLINIC.timezone)}`,
+    `среда ${nextIsoDateForWeekday(3, CLINIC.timezone)}`,
+    `четверг ${nextIsoDateForWeekday(4, CLINIC.timezone)}`,
+    `пятница ${nextIsoDateForWeekday(5, CLINIC.timezone)}`,
+    `суббота ${nextIsoDateForWeekday(6, CLINIC.timezone)}`,
+    `воскресенье ${nextIsoDateForWeekday(0, CLINIC.timezone)}`,
+  ].join(", ");
 
-Сегодня: ${today} (${weekday}), таймзона ${CLINIC.timezone}
+  return `Ты — администратор записи клиники «${CLINIC.name}» в WhatsApp.
+Цель: быстро записать на приём. Без лекций и без прайса.
+
+Сегодня: ${today} (${weekday}), ${CLINIC.timezone}
+Ближайшие дни (для find_slots.date): ${upcoming}
 Часы: Пн–Пт 10:00–20:00, Сб–Вс 10:00–14:00
 
-Врачи:
-1) Абдикаримова Асель — ортодонт (брекеты, элайнеры, прикус)
-2) Абдикаримов Ержан — терапевт (кариес, каналы, чистка, боли)
-3) Масенов Ансар Алмазович — терапевт (кариес, каналы, чистка)
+Врачи — ВСЕГДА все трое:
+1) Абдикаримова Асель — ортодонт, терапевт
+2) Абдикаримов Ержан — терапевт, хирург, ортопед
+3) Масенов Ансар — терапевт, хирург, ортопед
+Нельзя предлагать только двоих.
 
-=== Скрипт записи (строго по шагам, по 1 вопросу за сообщение) ===
-Шаг A — ОБЯЗАТЕЛЬНОЕ ПЕРВОЕ СООБЩЕНИЕ в диалоге.
-Всегда начинай от лица клиники, дружелюбно и коротко. Шаблон первой фразы:
+Направление:
+- брекеты, элайнеры, прикус, ортодонтия → Асель
+- удаление, имплант, хирургия, протез, коронка, ортопедия → Ержан или Ансар
+- кариес, каналы, чистка, боль, консультация терапевта → любой из троих (Асель тоже терапевт)
 
-«Здравствуйте! 😊
-Вас приветствует стоматологическая клиника «${CLINIC.name}».
-Чем мы можем вам помочь?»
+=== Порядок записи (строго, не прыгай через шаги) ===
+1) Пока врач не выбран — ТОЛЬКО список всех врачей и вопрос «К кому записать?». Не спрашивай дату. Не вызывай find_slots.
+2) Врач выбран — тогда: «На какую дату вам будет удобно назначить запись?»
+3) Дата есть — вызови find_slots. Если пациент уже назвал время — смотри requested_free.
+   Свободно: «Вам подойдёт в {это время}?»
+   Занято: «{время} занято. Вам подойдёт в {suggested}?» suggested — ближайшее к запросу, не первое утро, если вечером занято.
+   Не показывай список. Не пиши «перенос» на новую запись.
+   Если «да» и в ФИО только фамилия и имя — сначала отчество, потом подтверждение. book_appointment только с тремя словами.
 
-Если в первом же сообщении человек уже написал запрос (запись, боль, чистка и т.д.) — всё равно сначала эти 3 строки приветствия, а СРАЗУ ПОД ними коротко продолжай запись (без повторного «чем помочь»).
-Не начинай диалог с вопроса про врача/дату без этого приветствия.
-Не представляйся как «AI», «бот» или «нейросеть» — только как администратор клиники.
+Запрещено нумеровать слоты (1) 10:00 2) 10:30 …). Запрещено писать «подтверждаете перенос», если это новая запись.
 
-Шаг B. Определи направление:
-- ортодонтия / брекеты / прикус → Асель
-- боль, кариес, каналы, чистка, осмотр → Ержан или Ансар (если не указал врача — предложи обоих коротко и спроси кого удобнее)
-- неясно → предложи «первичную консультацию» у терапевта или ортодонта
-Шаг C. Если услуга неочевидна — НЕ показывай длинный список. Предложи 2–3 варианта максимум (например: консультация / лечение / чистка). Для точных id вызывай list_services по выбранному врачу и сопоставь.
-Шаг D. Спроси удобный день («сегодня / завтра / дата») или предложи ближайший рабочий день.
-Шаг E. Вызови find_slots. Покажи только 3–5 ближайших слотов нумерованным списком. Спроси номер слота.
-Шаг F. Спроси ФИО для записи (если ещё не назвали).
-Шаг G. Коротко повтори: врач, услуга, дата, время, ФИО → «Подтверждаете запись? Да/Нет»
-Шаг H. Только после явного «да/подтверждаю» вызови book_appointment и пришли подтверждение одной короткой карточкой.
+«Консультация» без имени врача = шаг 1, не слоты Асель и не вопрос про дату.
 
-Если человек хочет перенос/отмену — сразу get_patient_appointments и помоги через tools.
+Дальше Фамилия Имя Отчество → подтверждение → book_appointment.
 
-=== Стиль ===
-- Русский, коротко, как живой администратор WhatsApp (2–5 строк после приветствия).
-- Один вопрос за раз. Без markdown-таблиц, без звёздочек **, без длинных абзацев.
-- Можно нумерацию 1) 2) 3)
-- Не спрашивай телефон — он уже есть из WhatsApp.
-- Не выдумывай слоты, врачей, услуги, цены, наличие — только tools.
-- Не обсуждай цены, если не знаешь точно (у нас цен в системе нет) — скажи, что стоимость уточнит врач на приёме, и возвращайся к записи.
-- Если человек уходит в сторону — мягко верни: «Чтобы записать вас, осталось выбрать …»
-- «сброс» / «новый диалог» = начать скрипт с шага A заново (то же приветствие клиники).
-
-Плохо: длинный список из 15 услуг, медицинские советы, сухое «укажите услугу» без приветствия.
-Хорошо: приветствие клиники → «Запишу на консультацию к Ержану. На какой день удобнее — завтра или послезавтра?»`;
+Перенос существующей записи: find_slots, предложи одно время так же («Вам подойдёт в …?»), не список.
+WhatsApp: без markdown. Телефон не спрашивай.
+«сброс» = новый диалог.`;
 }
 
 const CLINIC_GREETING = `Здравствуйте! 😊
 Вас приветствует стоматологическая клиника «${CLINIC.name}».
 Чем мы можем вам помочь?`;
+
+function stripRepeatedGreeting(text: string): string {
+  const stripped = text
+    .replace(/^здравствуйте[^\n]*\n+/i, "")
+    .replace(/^вас приветствует стоматологическая клиника[^\n]*\n+/i, "")
+    .replace(/^чем мы можем вам помочь[^\n?]*\??\s*/i, "")
+    .trim();
+  return stripped || text;
+}
+
+function stripWhatsAppMarkdown(text: string): string {
+  let out = text
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/__(.+?)__/g, "$1")
+    .replace(/^[*-]\s+/gm, "")
+    .replace(/`+/g, "");
+  const slotLines = out.match(/^\s*\d+[).]\s*\d{1,2}:\d{2}\s*$/gm);
+  if (slotLines && slotLines.length >= 3) {
+    const first = slotLines[0].match(/(\d{1,2}:\d{2})/)?.[1];
+    if (first) {
+      out = out
+        .replace(/^\s*\d+[).]\s*\d{1,2}:\d{2}\s*$/gm, "")
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+      if (!/подойд/i.test(out)) {
+        out = `Вам подойдёт в ${first}?`;
+      }
+    }
+  }
+  return out.trim();
+}
+
+function hasClinicGreeting(history: ConversationMessage[]): boolean {
+  return history.some(
+    (m) =>
+      m.role === "assistant" &&
+      /приветствует стоматологическая клиника/i.test(m.content || "")
+  );
+}
+
+function parsePreferredTime(text: string): string | null {
+  const colon = text.match(/\b(\d{1,2})[:.](\d{2})\b/);
+  if (colon) {
+    const h = Number(colon[1]);
+    const m = Number(colon[2]);
+    if (h <= 23 && m <= 59) {
+      return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    }
+  }
+  const hourOnly = text.match(/(?:^|в|на)\s*(\d{1,2})\s*(?:час(?:а|ов)?|утра|дня|вечера)?\s*$/i)
+    || text.match(/\b(?:в|на)\s+(\d{1,2})\b/i);
+  if (hourOnly) {
+    const h = Number(hourOnly[1]);
+    if (h >= 8 && h <= 21) return `${String(h).padStart(2, "0")}:00`;
+  }
+  return null;
+}
+
+function timeToMinutes(t: string): number {
+  const [h, m] = t.split(":").map(Number);
+  return h * 60 + m;
+}
+
+function pickSuggestedSlot(
+  slots: string[],
+  preferred: string | null
+): { suggested: string | null; requested: string | null; requested_free: boolean | null } {
+  if (!slots.length) {
+    return { suggested: null, requested: preferred, requested_free: preferred ? false : null };
+  }
+  if (preferred && slots.includes(preferred)) {
+    return { suggested: preferred, requested: preferred, requested_free: true };
+  }
+  if (preferred) {
+    const p = timeToMinutes(preferred);
+    const suggested = slots.reduce((best, t) =>
+      Math.abs(timeToMinutes(t) - p) < Math.abs(timeToMinutes(best) - p) ? t : best
+    );
+    return { suggested, requested: preferred, requested_free: false };
+  }
+  return { suggested: slots[0], requested: null, requested_free: null };
+}
+
+function lastFindSlotsPayload(history: ConversationMessage[]): {
+  slots: string[];
+  date?: string;
+  doctor?: string;
+} | null {
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.role !== "tool" || m.name !== "find_slots" || !m.content) continue;
+    try {
+      const json = JSON.parse(m.content) as {
+        slots?: string[];
+        date?: string;
+        doctor?: string;
+      };
+      if (Array.isArray(json.slots)) {
+        return { slots: json.slots, date: json.date, doctor: json.doctor };
+      }
+    } catch {
+      /* skip */
+    }
+  }
+  return null;
+}
+
+function isTwoWordFio(text: string): boolean {
+  if (/\d/.test(text)) return false;
+  if (/да|нет|запис|консульт|подойд|сред|вторник|понедельник|врач|время|отмен/i.test(text)) {
+    return false;
+  }
+  const parts = text.trim().split(/\s+/).filter(Boolean);
+  return (
+    parts.length === 2 &&
+    parts.every((w) => /^[A-Za-zА-Яа-яЁёІіҰұҚқҒғӨөҺһ-]+$/.test(w))
+  );
+}
+
+function isOneWordPatronymic(text: string): boolean {
+  const parts = text.trim().split(/\s+/).filter(Boolean);
+  return (
+    parts.length === 1 &&
+    !/\d/.test(text) &&
+    /^[A-Za-zА-Яа-яЁёІіҰұҚқҒғӨөҺһ-]+$/.test(parts[0]) &&
+    !/^(да|нет|ок|хорошо)$/i.test(parts[0])
+  );
+}
+
+function replyForRequestedTime(
+  preferred: string,
+  slots: string[]
+): string {
+  const pick = pickSuggestedSlot(slots, preferred);
+  if (pick.requested_free) {
+    return `В ${preferred} свободно. Вам подойдёт в ${preferred}?`;
+  }
+  if (pick.suggested) {
+    return `${preferred} занято. Вам подойдёт в ${pick.suggested}?`;
+  }
+  return `${preferred} занято, на этот день свободных окон нет.`;
+}
+
+function textMentionsDoctor(
+  text: string,
+  doctors: { full_name: string }[]
+): boolean {
+  const n = normalizeName(text);
+  return doctors.some((d) => {
+    const tokens = nameTokens(d.full_name).filter((t) => t.length >= 4);
+    return tokens.some((t) => n.includes(t));
+  });
+}
+
+function historyHasChosenDoctor(
+  history: ConversationMessage[],
+  doctors: { full_name: string }[]
+): boolean {
+  const named = history.some(
+    (m) => m.role === "user" && m.content && textMentionsDoctor(m.content, doctors)
+  );
+  if (named) return true;
+  const listed = history.some(
+    (m) => m.role === "assistant" && m.content && /к какому врачу/i.test(m.content)
+  );
+  if (!listed) return false;
+  return history.some((m) => m.role === "user" && m.content && /^[123]$/.test(m.content.trim()));
+}
+
+function formatDoctorChoice(
+  doctors: { full_name: string; specialization: string }[]
+): string {
+  const lines = doctors.map(
+    (d, i) => `${i + 1}) ${doctorDisplayName(d.full_name)} — ${d.specialization}`
+  );
+  return `К какому врачу записать на консультацию?\n${lines.join("\n")}`;
+}
+
+function wantsNewBooking(text: string): boolean {
+  if (/отмен|перенес|поменять|попозже|проверить запис/i.test(text)) return false;
+  return /запис|консульт|к врачу|какой врач/i.test(text);
+}
+
+function looksLikeDateOnly(text: string): boolean {
+  return /^(на\s+)?(понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|сегодня|завтра)\b/i.test(
+    text.trim()
+  );
+}
+
+function historyAskedForBooking(history: ConversationMessage[]): boolean {
+  return history.some(
+    (m) =>
+      (m.role === "user" || m.role === "assistant") &&
+      m.content &&
+      /запис|консульт/i.test(m.content)
+  );
+}
 
 export class DialogOrchestrator {
   private readonly openai: OpenAI;
@@ -211,23 +412,33 @@ export class DialogOrchestrator {
     text: string;
   }): Promise<string> {
     const phone = normalizePhone(params.phone);
-    const text = params.text.trim();
+    let text = params.text.trim();
 
     if (!text) {
       return CLINIC_GREETING;
     }
 
     if (/^(сброс|reset|новый диалог)$/i.test(text)) {
-      await saveConversation(phone, []);
+      await saveConversation(phone, [
+        { role: "system", content: systemPrompt() },
+        { role: "assistant", content: CLINIC_GREETING },
+      ]);
       return CLINIC_GREETING;
     }
 
-    // Pure greeting / first hello — answer with clinic welcome without tools
+    let history = await loadConversation(phone);
+    const greeted = hasClinicGreeting(history);
+
     if (
       /^(привет|здравствуйте|здравстуйте|добрый\s+(день|вечер|утро)|hello|hi|hey)[\s!.]*$/i.test(
         text
       )
     ) {
+      if (greeted) {
+        return stripWhatsAppMarkdown(
+          "Чем могу помочь: запись, перенос или отмена?"
+        );
+      }
       await saveConversation(phone, [
         { role: "system", content: systemPrompt() },
         { role: "user", content: text },
@@ -236,14 +447,60 @@ export class DialogOrchestrator {
       return CLINIC_GREETING;
     }
 
-    let history = await loadConversation(phone);
-    const isNewDialog =
-      history.length === 0 ||
-      history.every((m) => m.role === "system");
+    const doctors = await this.booking.listDoctors();
+    const doctorChosen =
+      textMentionsDoctor(text, doctors) || historyHasChosenDoctor(history, doctors);
+    const mustPickDoctor =
+      !doctorChosen &&
+      (wantsNewBooking(text) ||
+        (looksLikeDateOnly(text) && historyAskedForBooking(history)));
 
-    const prompt = isNewDialog
-      ? `${systemPrompt()}\n\nСейчас ПЕРВОЕ сообщение пациента. Ответ ОБЯЗАН начинаться с приветствия клиники (шаг A).`
-      : systemPrompt();
+    if (mustPickDoctor) {
+      const reply = formatDoctorChoice(doctors);
+      if (history.length === 0) {
+        history = [{ role: "system", content: systemPrompt() }];
+      }
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+      await saveConversation(phone, history);
+      return reply;
+    }
+
+    const lastUser = [...history].reverse().find((m) => m.role === "user" && m.content);
+    if (isOneWordPatronymic(text) && lastUser?.content && isTwoWordFio(lastUser.content)) {
+      text = `${lastUser.content.trim()} ${text.trim()}`;
+    } else if (isTwoWordFio(text)) {
+      const reply =
+        "Напишите ещё отчество, как в удостоверении (три слова: фамилия, имя, отчество).";
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+      await saveConversation(phone, history);
+      return reply;
+    }
+
+    const askedTime = parsePreferredTime(text);
+    const prevSlots = lastFindSlotsPayload(history);
+    if (
+      askedTime &&
+      prevSlots?.slots?.length &&
+      !/^(да|хорошо|ок|подойд)/i.test(text.trim())
+    ) {
+      const reply = replyForRequestedTime(askedTime, prevSlots.slots);
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+      await saveConversation(phone, history);
+      return reply;
+    }
+
+    const isNewDialog =
+      !greeted &&
+      (history.length === 0 || history.every((m) => m.role === "system"));
+
+    const prompt = greeted
+      ? `${systemPrompt()}\n\nВ этом диалоге ты УЖЕ поздоровался. Не пиши «Здравствуйте» и не повторяй шапку клиники.`
+      : isNewDialog
+        ? `${systemPrompt()}\n\nСейчас ПЕРВОЕ сообщение пациента. Один раз поприветствуй клинику (шаг A), затем сразу продолжай запись.`
+        : systemPrompt();
 
     if (history.length === 0) {
       history.push({ role: "system", content: prompt });
@@ -290,7 +547,8 @@ export class DialogOrchestrator {
           const result = await this.executeTool(
             toolCall.function.name,
             toolCall.function.arguments,
-            phone
+            phone,
+            text
           );
           messages.push({
             role: "tool",
@@ -310,6 +568,9 @@ export class DialogOrchestrator {
       finalText =
         choice.content?.trim() ||
         "Готово. Если нужно что-то ещё — напишите.";
+      if (greeted) {
+        finalText = stripRepeatedGreeting(finalText);
+      }
       history.push({ role: "assistant", content: finalText });
       messages.push({ role: "assistant", content: finalText });
       break;
@@ -321,16 +582,20 @@ export class DialogOrchestrator {
     }
 
     await saveConversation(phone, history);
-    return finalText;
+    return stripWhatsAppMarkdown(
+      greeted ? stripRepeatedGreeting(finalText) : finalText
+    );
   }
 
   private async executeTool(
     name: string,
     argsJson: string,
-    phone: string
+    phone: string,
+    userText: string
   ): Promise<string> {
     try {
       const args = argsJson ? JSON.parse(argsJson) : {};
+      console.log(`tool ${name}`, args);
       switch (name) {
         case "list_doctors": {
           const doctors = await this.booking.listDoctors();
@@ -338,6 +603,7 @@ export class DialogOrchestrator {
             doctors.map((d) => ({
               id: d.id,
               full_name: d.full_name,
+              name: doctorDisplayName(d.full_name),
               specialization: d.specialization,
             }))
           );
@@ -345,14 +611,22 @@ export class DialogOrchestrator {
         case "find_slots": {
           const result = await this.booking.findSlots({
             doctorId: Number(args.doctor_id),
-            serviceId: Number(args.service_id),
+            serviceId:
+              args.service_id != null ? Number(args.service_id) : undefined,
             date: String(args.date),
           });
+          const preferred = parsePreferredTime(userText);
+          const pick = pickSuggestedSlot(result.slots, preferred);
           return JSON.stringify({
             ...result,
-            slots: result.slots.slice(0, 5),
+            ...pick,
+            slots: result.slots,
             slots_total: result.slots.length,
-            note: "Покажи пациенту только эти слоты нумерованным списком",
+            note: pick.requested_free
+              ? `Пациент просил ${pick.requested}. Оно свободно. Спроси: «Вам подойдёт в ${pick.suggested}?» Без списка.`
+              : pick.requested
+                ? `${pick.requested} занято (или не влезает в окно). Предложи ближайшее: «${pick.requested} занято. Вам подойдёт в ${pick.suggested}?» Не предлагай 10:00, если suggested другое.`
+                : `Одно время: «Вам подойдёт в ${pick.suggested}?» Без списка слотов.`,
           });
         }
         case "list_services": {
@@ -404,16 +678,20 @@ export class DialogOrchestrator {
         }
         case "get_patient_appointments": {
           const list = await this.booking.getPatientAppointments(phone);
-          return JSON.stringify(
-            list.map((a) => ({
+          const inMacdent = list.filter((a) => a.macdent_zapis_id);
+          const shown = inMacdent.length ? inMacdent : list;
+          return JSON.stringify({
+            note: "Пациенту называй date и time. Если он говорит про один день — только этот день. Не выдумывай лишние записи.",
+            appointments: shown.map((a) => ({
               id: a.id,
               doctor: a.doctor_name,
               service: a.service_name,
-              starts_at: a.starts_at.toISOString(),
+              date: formatDateInTz(a.starts_at, CLINIC.timezone),
+              time: formatTimeInTz(a.starts_at, CLINIC.timezone),
+              in_macdent: Boolean(a.macdent_zapis_id),
               status: a.status,
-              summary: this.booking.formatAppointment(a),
-            }))
-          );
+            })),
+          });
         }
         case "reschedule_appointment": {
           const appt = await this.booking.rescheduleAppointment({

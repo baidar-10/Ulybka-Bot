@@ -88,6 +88,24 @@ export function zonedDateTime(
   return new Date(utcGuess.getTime() - offset);
 }
 
+export function nextIsoDateForWeekday(
+  targetDow: number,
+  timeZone: string,
+  from = new Date()
+): string {
+  const todayIso = formatDateInTz(from, timeZone);
+  const { year, month, day } = parseDateString(todayIso);
+  const todayDow = getDayOfWeekInTz(
+    zonedDateTime(year, month, day, 12, 0, timeZone),
+    timeZone
+  );
+  let ahead = (targetDow - todayDow + 7) % 7;
+  if (ahead === 0 && targetDow !== todayDow) ahead = 7;
+  const start = zonedDateTime(year, month, day, 12, 0, timeZone);
+  const target = new Date(start.getTime() + ahead * 24 * 60 * 60 * 1000);
+  return formatDateInTz(target, timeZone);
+}
+
 export function parseDateString(dateStr: string): {
   year: number;
   month: number;

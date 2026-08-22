@@ -13,8 +13,9 @@ import {
   generateSlots,
   slotToRange,
 } from "./slots.js";
-import type { GoogleCalendarClient } from "../calendar/google.js";
-import { resolveCalendarId } from "../calendar/google.js";
+import type { MacdentSchedule } from "../macdent/schedule.js";
+import { MacdentError } from "../macdent/client.js";
+import { formatPatientFio } from "../macdent/parse.js";
 
 export class BookingError extends Error {
   constructor(message: string) {
@@ -35,18 +36,20 @@ function mapAppointment(row: Record<string, unknown>): Appointment {
     status: row.status as Appointment["status"],
     comment: (row.comment as string | null) ?? null,
     source: String(row.source ?? "whatsapp_ai"),
-    google_event_id: (row.google_event_id as string | null) ?? null,
+    macdent_zapis_id: row.macdent_zapis_id
+      ? String(row.macdent_zapis_id)
+      : null,
     doctor_name: row.doctor_name ? String(row.doctor_name) : undefined,
     service_name: row.service_name ? String(row.service_name) : undefined,
   };
 }
 
 export class BookingService {
-  constructor(private readonly calendar?: GoogleCalendarClient) {}
+  constructor(private readonly macdent?: MacdentSchedule) {}
 
   async listDoctors(): Promise<Doctor[]> {
     const { rows } = await pool.query(
-      `SELECT id, full_name, specialization, google_calendar_id, color, active
+      `SELECT id, full_name, specialization, color, macdent_id, active
        FROM doctors WHERE active = TRUE ORDER BY id`
     );
     return rows as Doctor[];
@@ -73,7 +76,7 @@ export class BookingService {
 
   async getDoctor(id: number): Promise<Doctor | null> {
     const { rows } = await pool.query(
-      `SELECT id, full_name, specialization, google_calendar_id, color, active
+      `SELECT id, full_name, specialization, color, macdent_id, active
        FROM doctors WHERE id = $1`,
       [id]
     );
@@ -87,6 +90,23 @@ export class BookingService {
       [id]
     );
     return (rows[0] as Service) ?? null;
+  }
+
+  async resolveService(doctorId: number, serviceId?: number): Promise<Service> {
+    if (serviceId != null) {
+      const service = await this.getService(serviceId);
+      if (
+        service?.active &&
+        (service.doctor_id == null || service.doctor_id === doctorId)
+      ) {
+        return service;
+      }
+    }
+    const list = await this.listServices(doctorId);
+    const consult = list.find((s) => /консульт/i.test(s.name));
+    if (consult) return consult;
+    if (list[0]) return list[0];
+    throw new BookingError("У этого врача нет услуг в каталоге");
   }
 
   private async getHoursForDate(dateStr: string): Promise<ClinicHour | undefined> {
@@ -117,7 +137,7 @@ export class BookingService {
   async findSlots(params: {
     doctorId: number;
     date: string;
-    serviceId: number;
+    serviceId?: number;
   }): Promise<{
     date: string;
     doctor: string;
@@ -130,13 +150,7 @@ export class BookingService {
     if (!doctor || !doctor.active) {
       throw new BookingError("Врач не найден или неактивен");
     }
-    const service = await this.getService(params.serviceId);
-    if (!service || !service.active) {
-      throw new BookingError("Услуга не найдена");
-    }
-    if (service.doctor_id != null && service.doctor_id !== params.doctorId) {
-      throw new BookingError("Эта услуга недоступна у выбранного врача");
-    }
+    const service = await this.resolveService(params.doctorId, params.serviceId);
 
     const hours = await this.getHoursForDate(params.date);
     const dayStart = slotToRange({
@@ -146,25 +160,54 @@ export class BookingService {
       timeZone: CLINIC.timezone,
     });
 
-    const { rows } = await pool.query(
-      `SELECT starts_at, ends_at FROM appointments
-       WHERE doctor_id = $1
-         AND status IN ('booked', 'rescheduled')
-         AND starts_at < $3
-         AND ends_at > $2`,
-      [params.doctorId, dayStart.startsAt, dayStart.endsAt]
-    );
+    let slots: string[];
+    if (this.macdent?.enabled) {
+      const macdentDoctorId = await this.resolveMacdentDoctorId(doctor);
+      const day = await this.macdent.getDayAvailability(
+        macdentDoctorId,
+        params.date,
+        service.duration_minutes,
+        hours
+          ? { open_time: String(hours.open_time).slice(0, 5), close_time: String(hours.close_time).slice(0, 5) }
+          : null
+      );
+      console.log(
+        `MacDent day slots doctor=${macdentDoctorId} date=${params.date} slots=${day.slots.join(",") || "(empty)"}`
+      );
+      slots = day.slots.filter((t) => {
+        try {
+          const { startsAt } = slotToRange({
+            dateStr: params.date,
+            timeStr: t,
+            durationMinutes: service.duration_minutes,
+            timeZone: CLINIC.timezone,
+          });
+          return startsAt > new Date();
+        } catch {
+          return false;
+        }
+      });
+    } else {
+      const { rows } = await pool.query(
+        `SELECT starts_at, ends_at FROM appointments
+         WHERE doctor_id = $1
+           AND status IN ('booked', 'rescheduled')
+           AND starts_at < $3
+           AND ends_at > $2`,
+        [params.doctorId, dayStart.startsAt, dayStart.endsAt]
+      );
 
-    const slots = generateSlots({
-      dateStr: params.date,
-      durationMinutes: service.duration_minutes,
-      hours,
-      busy: rows.map((r) => ({
-        starts_at: new Date(r.starts_at),
-        ends_at: new Date(r.ends_at),
-      })),
-      timeZone: CLINIC.timezone,
-    });
+      slots = generateSlots({
+        dateStr: params.date,
+        durationMinutes: service.duration_minutes,
+        hours,
+        busy: rows.map((r) => ({
+          starts_at: new Date(r.starts_at),
+          ends_at: new Date(r.ends_at),
+        })),
+        timeZone: CLINIC.timezone,
+      });
+    }
 
     return {
       date: params.date,
@@ -187,14 +230,12 @@ export class BookingService {
   }): Promise<Appointment> {
     const doctor = await this.getDoctor(params.doctorId);
     if (!doctor?.active) throw new BookingError("Врач не найден");
-    const service = await this.getService(params.serviceId);
-    if (!service?.active) throw new BookingError("Услуга не найдена");
-    if (service.doctor_id != null && service.doctor_id !== params.doctorId) {
-      throw new BookingError("Услуга недоступна у этого врача");
-    }
+    const service = await this.resolveService(params.doctorId, params.serviceId);
 
-    const hours = await this.getHoursForDate(params.date);
-    if (!hours) throw new BookingError("Клиника закрыта в этот день");
+    if (!this.macdent?.enabled) {
+      const hours = await this.getHoursForDate(params.date);
+      if (!hours) throw new BookingError("Клиника закрыта в этот день");
+    }
 
     const { startsAt, endsAt } = slotToRange({
       dateStr: params.date,
@@ -205,6 +246,13 @@ export class BookingService {
 
     if (startsAt <= new Date()) {
       throw new BookingError("Нельзя записаться на прошедшее время");
+    }
+
+    const patientFio = formatPatientFio(params.patientName);
+    if (patientFio.split(" ").length < 3) {
+      throw new BookingError(
+        "Для записи нужны фамилия, имя и отчество полностью, как в удостоверении"
+      );
     }
 
     // Verify chosen time is within generated free slots
@@ -220,28 +268,56 @@ export class BookingService {
     }
 
     try {
+      let macdentZapisId: string | null = null;
+      if (this.macdent?.enabled) {
+        try {
+          const macdentDoctorId = await this.resolveMacdentDoctorId(doctor);
+          const patientId = await this.macdent.ensurePatient(
+            patientFio,
+            normalizePhone(params.phone)
+          );
+          const day = await this.macdent.getDayAvailability(
+            macdentDoctorId,
+            params.date,
+            service.duration_minutes
+          );
+          macdentZapisId = await this.macdent.addZapis({
+            doctorId: macdentDoctorId,
+            patientId,
+            date: params.date,
+            time: params.time,
+            durationMinutes: service.duration_minutes,
+            raspId: day.raspId,
+            comment: params.comment?.trim() || service.name,
+          });
+        } catch (err) {
+          const message =
+            err instanceof MacdentError ? err.message : "не удалось создать запись в MacDent";
+          throw new BookingError(`MacDent: ${message}`);
+        }
+      }
+
       const appointment = await withTransaction(async (client) => {
         const { rows } = await client.query(
           `INSERT INTO appointments
-             (patient_name, phone, doctor_id, service_id, starts_at, ends_at, status, comment, source)
-           VALUES ($1, $2, $3, $4, $5, $6, 'booked', $7, 'whatsapp_ai')
+             (patient_name, phone, doctor_id, service_id, starts_at, ends_at, status, comment, source, macdent_zapis_id)
+           VALUES ($1, $2, $3, $4, $5, $6, 'booked', $7, 'whatsapp_ai', $8)
            RETURNING *`,
           [
-            params.patientName.trim(),
+            patientFio,
             normalizePhone(params.phone),
             params.doctorId,
             params.serviceId,
             startsAt,
             endsAt,
             params.comment?.trim() || null,
+            macdentZapisId,
           ]
         );
         return mapAppointment(rows[0]);
       });
 
-      const enriched = await this.enrich(appointment);
-      await this.syncCreate(enriched, doctor);
-      return enriched;
+      return this.enrich(appointment);
     } catch (err: unknown) {
       if (isExclusionViolation(err)) {
         throw new BookingError(
@@ -271,7 +347,7 @@ export class BookingService {
     appointmentId: number;
     phone: string;
   }): Promise<Appointment> {
-    const { updated, doctor } = await withTransaction(async (client) => {
+    const { updated } = await withTransaction(async (client) => {
       const existing = await this.lockAppointment(
         client,
         params.appointmentId,
@@ -290,13 +366,17 @@ export class BookingService {
       );
       const row = mapAppointment(rows[0]);
       const enriched = await this.enrich(row, client);
-      const doc = await this.getDoctor(enriched.doctor_id);
-      return { updated: enriched, doctor: doc };
+      return { updated: enriched };
     });
 
-    if (doctor) {
-      await this.syncCancel(updated, doctor);
+    if (this.macdent?.enabled && updated.macdent_zapis_id) {
+      try {
+        await this.macdent.removeZapis(updated.macdent_zapis_id);
+      } catch (err) {
+        console.error("MacDent zapis.remove failed", err);
+      }
     }
+
     return updated;
   }
 
@@ -307,7 +387,7 @@ export class BookingService {
     time: string;
   }): Promise<Appointment> {
     try {
-      const { updated, doctor, service } = await withTransaction(
+      const { updated, durationMinutes } = await withTransaction(
         async (client) => {
           const existing = await this.lockAppointment(
             client,
@@ -381,14 +461,55 @@ export class BookingService {
             [startsAt, endsAt, existing.id]
           );
           const enriched = await this.enrich(mapAppointment(rows[0]), client);
-          const doc = await this.getDoctor(enriched.doctor_id);
-          return { updated: enriched, doctor: doc, service: serviceRow };
+          return { updated: enriched, durationMinutes: serviceRow.duration_minutes };
         }
       );
 
-      if (doctor) {
-        await this.syncUpdate(updated, doctor, service);
+      if (this.macdent?.enabled) {
+        try {
+          const date = formatDateInTz(updated.starts_at, CLINIC.timezone);
+          const time = formatTimeInTz(updated.starts_at, CLINIC.timezone);
+          if (updated.macdent_zapis_id) {
+            await this.macdent.updateZapis({
+              zapisId: updated.macdent_zapis_id,
+              date,
+              time,
+              durationMinutes,
+            });
+          } else {
+            const doctor = await this.getDoctor(updated.doctor_id);
+            if (doctor) {
+              const macdentDoctorId = await this.resolveMacdentDoctorId(doctor);
+              const patientId = await this.macdent.ensurePatient(
+                updated.patient_name,
+                updated.phone
+              );
+              const day = await this.macdent.getDayAvailability(
+                macdentDoctorId,
+                date,
+                durationMinutes
+              );
+              const zapisId = await this.macdent.addZapis({
+                doctorId: macdentDoctorId,
+                patientId,
+                date,
+                time,
+                durationMinutes,
+                raspId: day.raspId,
+                comment: updated.service_name,
+              });
+              await pool.query(
+                `UPDATE appointments SET macdent_zapis_id = $1 WHERE id = $2`,
+                [zapisId, updated.id]
+              );
+              updated.macdent_zapis_id = zapisId;
+            }
+          }
+        } catch (err) {
+          console.error("MacDent zapis.update failed", err);
+        }
       }
+
       return updated;
     } catch (err: unknown) {
       if (isExclusionViolation(err)) {
@@ -432,63 +553,23 @@ export class BookingService {
     return mapAppointment(rows[0] ?? appointment);
   }
 
-  private async syncCreate(appointment: Appointment, doctor: Doctor) {
-    const calendarId = resolveCalendarId(doctor.google_calendar_id);
-    if (!this.calendar?.enabled || !calendarId) return;
-    try {
-      const eventId = await this.calendar.createEvent({
-        calendarId,
-        appointment,
-      });
-      await pool.query(
-        `UPDATE appointments SET google_event_id = $1 WHERE id = $2`,
-        [eventId, appointment.id]
+  private async resolveMacdentDoctorId(doctor: Doctor): Promise<string> {
+    if (!this.macdent?.enabled) {
+      throw new BookingError("MacDent не подключен");
+    }
+    if (doctor.macdent_id) return doctor.macdent_id;
+    const found = await this.macdent.findDoctorId(doctor.full_name);
+    if (!found) {
+      throw new BookingError(
+        `Врач «${doctor.full_name}» не найден в MacDent`
       );
-      appointment.google_event_id = eventId;
-    } catch (err) {
-      console.error("Google Calendar create failed", err);
     }
-  }
-
-  private async syncUpdate(
-    appointment: Appointment,
-    doctor: Doctor,
-    service: Service
-  ) {
-    const calendarId = resolveCalendarId(doctor.google_calendar_id);
-    if (!this.calendar?.enabled || !calendarId) return;
-    try {
-      if (appointment.google_event_id) {
-        await this.calendar.updateEvent({
-          calendarId,
-          eventId: appointment.google_event_id,
-          appointment: { ...appointment, service_name: service.name },
-        });
-      } else {
-        await this.syncCreate(appointment, doctor);
-      }
-    } catch (err) {
-      console.error("Google Calendar update failed", err);
-    }
-  }
-
-  private async syncCancel(appointment: Appointment, doctor: Doctor) {
-    const calendarId = resolveCalendarId(doctor.google_calendar_id);
-    if (
-      !this.calendar?.enabled ||
-      !calendarId ||
-      !appointment.google_event_id
-    ) {
-      return;
-    }
-    try {
-      await this.calendar.cancelEvent({
-        calendarId,
-        eventId: appointment.google_event_id,
-      });
-    } catch (err) {
-      console.error("Google Calendar cancel failed", err);
-    }
+    await pool.query(`UPDATE doctors SET macdent_id = $1 WHERE id = $2`, [
+      found,
+      doctor.id,
+    ]);
+    doctor.macdent_id = found;
+    return found;
   }
 
   formatAppointment(a: Appointment): string {

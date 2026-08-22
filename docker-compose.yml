@@ -33,7 +33,6 @@ services:
       - "${BOT_PORT:-3000}:3000"
     volumes:
       - ./data/whatsapp-auth:/data/whatsapp-auth
-      - ./secrets:/secrets:ro
 
 volumes:
   postgres_data:

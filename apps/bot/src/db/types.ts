@@ -4,8 +4,8 @@ export interface Doctor {
   id: number;
   full_name: string;
   specialization: string;
-  google_calendar_id: string | null;
   color: string | null;
+  macdent_id: string | null;
   active: boolean;
 }
 
@@ -36,7 +36,7 @@ export interface Appointment {
   status: AppointmentStatus;
   comment: string | null;
   source: string;
-  google_event_id: string | null;
+  macdent_zapis_id: string | null;
   doctor_name?: string;
   service_name?: string;
 }
