@@ -6,8 +6,6 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-ulybka}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ulybka}
       POSTGRES_DB: ${POSTGRES_DB:-ulybka}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
