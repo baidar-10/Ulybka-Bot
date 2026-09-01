@@ -1,5 +1,5 @@
 import { CLINIC } from "../config/hours.js";
-import { generateSlots, slotToRange, zonedDateTime, type BusyInterval } from "../booking/slots.js";
+import { formatTimeInTz, generateSlots, slotToRange, zonedDateTime, type BusyInterval } from "../booking/slots.js";
 import type { MacdentClient } from "./client.js";
 import { MacdentError } from "./client.js";
 import {
@@ -15,6 +15,47 @@ import {
   pickString,
   toMacdentDate,
 } from "./parse.js";
+
+function timeToMinutesLocal(time: string): number {
+  const [h, m] = time.split(":").map(Number);
+  return h * 60 + (m || 0);
+}
+
+function minutesToTime(minutes: number): string {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}
+
+function mergeTimeWindows(
+  windows: { open_time: string; close_time: string }[]
+): { open_time: string; close_time: string }[] {
+  const intervals = windows
+    .map((w) => ({
+      start: timeToMinutesLocal(w.open_time),
+      end: timeToMinutesLocal(w.close_time),
+    }))
+    .filter((w) => w.end > w.start)
+    .sort((a, b) => a.start - b.start);
+
+  if (!intervals.length) return [];
+
+  const merged: { start: number; end: number }[] = [intervals[0]];
+  for (let i = 1; i < intervals.length; i++) {
+    const last = merged[merged.length - 1];
+    const cur = intervals[i];
+    if (cur.start <= last.end) {
+      last.end = Math.max(last.end, cur.end);
+    } else {
+      merged.push(cur);
+    }
+  }
+
+  return merged.map((w) => ({
+    open_time: minutesToTime(w.start),
+    close_time: minutesToTime(w.end),
+  }));
+}
 
 export class MacdentSchedule {
   constructor(private readonly api: MacdentClient) {}
@@ -69,6 +110,55 @@ export class MacdentSchedule {
       }
     }
     return [...slots].sort();
+  }
+
+  /** Free gaps between busy appointments within clinic hours (MacDent get_free_time can be incomplete). */
+  private gapsFromBusyAndClinic(
+    isoDate: string,
+    clinicHours: { open_time: string; close_time: string },
+    busy: BusyInterval[]
+  ): { open_time: string; close_time: string }[] {
+    const tz = CLINIC.timezone;
+    const dayOpen = slotToRange({
+      dateStr: isoDate,
+      timeStr: clinicHours.open_time,
+      durationMinutes: 1,
+      timeZone: tz,
+    }).startsAt;
+    const dayClose = slotToRange({
+      dateStr: isoDate,
+      timeStr: clinicHours.close_time,
+      durationMinutes: 1,
+      timeZone: tz,
+    }).startsAt;
+
+    const relevant = busy
+      .filter((b) => b.ends_at > dayOpen && b.starts_at < dayClose)
+      .sort((a, b) => a.starts_at.getTime() - b.starts_at.getTime());
+
+    const gaps: { open_time: string; close_time: string }[] = [];
+    let cursor = dayOpen.getTime();
+
+    for (const block of relevant) {
+      const blockStart = Math.max(block.starts_at.getTime(), dayOpen.getTime());
+      const blockEnd = Math.min(block.ends_at.getTime(), dayClose.getTime());
+      if (blockStart > cursor) {
+        gaps.push({
+          open_time: formatTimeInTz(new Date(cursor), tz),
+          close_time: formatTimeInTz(new Date(blockStart), tz),
+        });
+      }
+      if (blockEnd > cursor) cursor = blockEnd;
+    }
+
+    if (cursor < dayClose.getTime()) {
+      gaps.push({
+        open_time: formatTimeInTz(new Date(cursor), tz),
+        close_time: clinicHours.close_time,
+      });
+    }
+
+    return gaps.filter((g) => timeToMinutesLocal(g.open_time) < timeToMinutesLocal(g.close_time));
   }
 
   async getDayAvailability(
@@ -148,6 +238,16 @@ export class MacdentSchedule {
       } catch (err) {
         console.error("MacDent doctor.get_free_time failed", err);
       }
+    }
+
+    if (clinicHours) {
+      const gapWindows = this.gapsFromBusyAndClinic(isoDate, clinicHours, busy);
+      if (gapWindows.length) {
+        console.log(
+          `MacDent gap windows from zapis ${gapWindows.map((w) => `${w.open_time}-${w.close_time}`).join(",")}`
+        );
+      }
+      windows = mergeTimeWindows([...windows, ...gapWindows]);
     }
 
     // Empty rasp / empty get_free_time / empty zapis ≠ busy.

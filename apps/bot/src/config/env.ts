@@ -29,6 +29,7 @@ const envSchema = z.object({
   GREEN_API_ID_INSTANCE: z.string().default(""),
   GREEN_API_TOKEN_INSTANCE: z.string().default(""),
   CLINIC_NAME: z.string().default("Улыбка столицы"),
+  CLINIC_ADDRESS: z.string().default(""),
   LOG_LEVEL: z.string().default("info"),
   MACDENT_API_URL: z.string().default("https://api-developer.macdent.kz"),
   MACDENT_API_KEY: z.string().default(""),

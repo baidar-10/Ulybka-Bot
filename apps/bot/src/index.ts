@@ -10,6 +10,7 @@ import {
 import { createGreenApiProvider } from "./whatsapp/green-api.js";
 import { createMacdentClient } from "./macdent/client.js";
 import { MacdentSchedule } from "./macdent/schedule.js";
+import { startNotificationScheduler } from "./jobs/scheduler.js";
 
 async function main() {
   const macdent = createMacdentClient();
@@ -45,8 +46,11 @@ async function main() {
     };
   });
 
+  let stopNotifications = () => {};
+
   const shutdown = async () => {
     app.log.info("Shutting down...");
+    stopNotifications();
     await whatsapp.stop();
     await app.close();
     await pool.end();
@@ -57,6 +61,9 @@ async function main() {
 
   await app.listen({ port: env.PORT, host: "0.0.0.0" });
   app.log.info(`HTTP listening on :${env.PORT}`);
+
+  stopNotifications = startNotificationScheduler(whatsapp);
+  app.log.info("Notification scheduler started (reminders + follow-up)");
 
   await whatsapp.start();
 }

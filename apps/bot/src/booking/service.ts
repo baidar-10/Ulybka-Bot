@@ -16,6 +16,12 @@ import {
 import type { MacdentSchedule } from "../macdent/schedule.js";
 import { MacdentError } from "../macdent/client.js";
 import { formatPatientFio } from "../macdent/parse.js";
+import {
+  applySameDaySlotPolicy,
+  earliestBookableDateIso,
+  isDateBookable,
+  isSlotTimeAllowed,
+} from "./policy.js";
 
 export class BookingError extends Error {
   constructor(message: string) {
@@ -150,6 +156,11 @@ export class BookingService {
     if (!doctor || !doctor.active) {
       throw new BookingError("Врач не найден или неактивен");
     }
+    if (!isDateBookable(params.date)) {
+      throw new BookingError(
+        `Запись возможна начиная с ${earliestBookableDateIso()}`
+      );
+    }
     const service = await this.resolveService(params.doctorId, params.serviceId);
 
     const hours = await this.getHoursForDate(params.date);
@@ -209,6 +220,8 @@ export class BookingService {
       });
     }
 
+    slots = applySameDaySlotPolicy(slots, params.date);
+
     return {
       date: params.date,
       doctor: doctor.full_name,
@@ -237,6 +250,18 @@ export class BookingService {
       if (!hours) throw new BookingError("Клиника закрыта в этот день");
     }
 
+    if (!isDateBookable(params.date)) {
+      throw new BookingError(
+        `Запись возможна начиная с ${earliestBookableDateIso()}`
+      );
+    }
+
+    if (!isSlotTimeAllowed(params.date, params.time)) {
+      throw new BookingError(
+        `До 12:00 запись на сегодня возможна только с 16:00`
+      );
+    }
+
     const { startsAt, endsAt } = slotToRange({
       dateStr: params.date,
       timeStr: params.time,
@@ -251,7 +276,7 @@ export class BookingService {
     const patientFio = formatPatientFio(params.patientName);
     if (patientFio.split(" ").length < 3) {
       throw new BookingError(
-        "Для записи нужны фамилия, имя и отчество полностью, как в удостоверении"
+        "Подскажите, пожалуйста, полное имя — фамилию, имя и отчество — чтобы оформить запись"
       );
     }
 
@@ -398,6 +423,12 @@ export class BookingService {
             throw new BookingError("Нельзя перенести отменённую запись");
           }
 
+          if (!isDateBookable(params.date)) {
+            throw new BookingError(
+              `Запись возможна начиная с ${earliestBookableDateIso()}`
+            );
+          }
+
           const serviceRow = await this.getService(existing.service_id);
           if (!serviceRow) throw new BookingError("Услуга не найдена");
 
@@ -461,6 +492,26 @@ export class BookingService {
             [startsAt, endsAt, existing.id]
           );
           const enriched = await this.enrich(mapAppointment(rows[0]), client);
+          const hoursUntil =
+            (startsAt.getTime() - Date.now()) / (1000 * 60 * 60);
+          if (hoursUntil > 25) {
+            await client.query(
+              `UPDATE appointments
+               SET reminder_24h_sent_at = NULL,
+                   reminder_2h_sent_at = NULL,
+                   updated_at = NOW()
+               WHERE id = $1`,
+              [existing.id]
+            );
+          } else {
+            await client.query(
+              `UPDATE appointments
+               SET reminder_2h_sent_at = NULL,
+                   updated_at = NOW()
+               WHERE id = $1`,
+              [existing.id]
+            );
+          }
           return { updated: enriched, durationMinutes: serviceRow.duration_minutes };
         }
       );

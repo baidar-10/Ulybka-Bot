@@ -11,12 +11,34 @@ import {
   normalizePhone,
 } from "../booking/service.js";
 import {
-  loadConversation,
+  clearConversation,
+  isFirstContactToday,
+  isReturningClient,
+  loadConversationRecord,
+  markGreetedToday,
   saveConversation,
 } from "../db/conversations.js";
 import type { ConversationMessage } from "../db/types.js";
 import { doctorDisplayName, nameTokens, normalizeName } from "../macdent/parse.js";
 import { formatDateInTz, formatTimeInTz, nextIsoDateForWeekday } from "../booking/slots.js";
+import {
+  buildDailyGreeting,
+  buildNewClientGreeting,
+  isGreetingOnly,
+} from "./greeting.js";
+import {
+  formatAppointmentLookupReply,
+  formatBookingConfirmation,
+  formatDateHumanRu,
+  formatRescheduleConfirmation,
+} from "./booking-messages.js";
+import {
+  earliestBookableDateIso,
+  isDateBookable,
+  sameDayBookingRuleText,
+  todayIso,
+  tomorrowIso,
+} from "../booking/policy.js";
 
 const tools: ChatCompletionTool[] = [
   {
@@ -72,7 +94,7 @@ const tools: ChatCompletionTool[] = [
         properties: {
           patient_name: {
             type: "string",
-            description: "Фамилия Имя Отчество пациента, как в документе",
+            description: "Полное ФИО пациента: фамилия, имя, отчество",
           },
           doctor_id: { type: "integer" },
           service_id: { type: "integer" },
@@ -161,12 +183,22 @@ function systemPrompt(): string {
     `воскресенье ${nextIsoDateForWeekday(0, CLINIC.timezone)}`,
   ].join(", ");
 
-  return `Ты — администратор записи клиники «${CLINIC.name}» в WhatsApp.
-Цель: быстро записать на приём. Без лекций и без прайса.
+  return `Ты — живой и доброжелательный администратор клиники «${CLINIC.name}» в WhatsApp.
+Цель: быстро и приятно записать на приём. Без лекций и без прайса.
+
+=== Тон общения ===
+- Тёплый, человечный, на «вы». Как администратор в хорошей клинике, не как робот.
+- Коротко: «Отлично!», «Замечательно», «Хорошо», «Подскажите, пожалуйста…»
+- ЗАПРЕЩЁН канцелярит и сухие формулировки.
+- Плохо: «Фамилия, имя, отчество как в документе, пожалуйста.»
+- Хорошо: «Отлично! Подскажите, пожалуйста, ваше полное имя — фамилию, имя и отчество — чтобы я оформил запись.»
+- Плохо: «Укажите дату.» Хорошо: «Когда вам было бы удобно прийти?»
 
 Сегодня: ${today} (${weekday}), ${CLINIC.timezone}
 Ближайшие дни (для find_slots.date): ${upcoming}
 Часы: Пн–Пт 10:00–20:00, Сб–Вс 10:00–14:00
+${CLINIC.address ? `Адрес клиники (только этот, никогда не выдумывай другой): ${CLINIC.address}` : "Адрес клиники в системе не задан — при вопросе об адресе скажи, что уточните у администратора."}
+${sameDayBookingRuleText()}
 
 Врачи — ВСЕГДА все трое:
 1) Абдикаримова Асель — ортодонт, терапевт
@@ -180,36 +212,31 @@ function systemPrompt(): string {
 - кариес, каналы, чистка, боль, консультация терапевта → любой из троих (Асель тоже терапевт)
 
 === Порядок записи (строго, не прыгай через шаги) ===
-1) Пока врач не выбран — ТОЛЬКО список всех врачей и вопрос «К кому записать?». Не спрашивай дату. Не вызывай find_slots.
-2) Врач выбран — тогда: «На какую дату вам будет удобно назначить запись?»
+1) Пока врач не выбран — сначала тепло: «Спасибо, что обратились и доверились нашей клинике 🫶🏻» Затем список всех врачей и вопрос «К какому врачу вам удобнее записаться?». Не спрашивай дату. Не вызывай find_slots.
+2) Врач выбран — тогда по-дружески: «Когда вам было бы удобно прийти?» или «На какую дату записать?»
 3) Дата есть — вызови find_slots. Если пациент уже назвал время — смотри requested_free.
    Свободно: «Вам подойдёт в {это время}?»
-   Занято: «{время} занято. Вам подойдёт в {suggested}?» suggested — ближайшее к запросу, не первое утро, если вечером занято.
+   Занято: «К сожалению, {время} уже занято. Могу предложить {suggested} — подойдёт?» suggested — ближайшее к запросу.
    Не показывай список. Не пиши «перенос» на новую запись.
-   Если «да» и в ФИО только фамилия и имя — сначала отчество, потом подтверждение. book_appointment только с тремя словами.
+   Если пациент говорит «нет» на предложенное время — это отказ от времени, НЕ «занято». Предложи другое свободное время.
+4) Время подтверждено — тепло попроси ФИО: «Отлично! Подскажите, пожалуйста, ваше полное имя — фамилию, имя и отчество.»
+   Если дали только фамилию и имя — мягко: «Спасибо! А подскажите ещё отчество — нужно для оформления записи.»
+   book_appointment только с тремя словами в ФИО.
+5) ФИО есть — кратко переспроси запись и жди «да» → book_appointment. После успешной записи отправь пациенту confirmation_message из ответа tool без изменений.
 
 Запрещено нумеровать слоты (1) 10:00 2) 10:30 …). Запрещено писать «подтверждаете перенос», если это новая запись.
 
 «Консультация» без имени врача = шаг 1, не слоты Асель и не вопрос про дату.
 
-Дальше Фамилия Имя Отчество → подтверждение → book_appointment.
-
 Перенос существующей записи: find_slots, предложи одно время так же («Вам подойдёт в …?»), не список.
 WhatsApp: без markdown. Телефон не спрашивай.
-«сброс» = новый диалог.`;
+«сброс» = новый диалог. Приветствие отправляет система — не повторяй шапку клиники в каждом ответе.`;
 }
 
-const CLINIC_GREETING = `Здравствуйте! 😊
-Вас приветствует стоматологическая клиника «${CLINIC.name}».
-Чем мы можем вам помочь?`;
-
-function stripRepeatedGreeting(text: string): string {
-  const stripped = text
-    .replace(/^здравствуйте[^\n]*\n+/i, "")
-    .replace(/^вас приветствует стоматологическая клиника[^\n]*\n+/i, "")
-    .replace(/^чем мы можем вам помочь[^\n?]*\??\s*/i, "")
-    .trim();
-  return stripped || text;
+function prependDailyGreeting(greeting: string, body: string): string {
+  const trimmed = body.trim();
+  if (!trimmed) return greeting;
+  return `${greeting}\n\n${trimmed}`;
 }
 
 function stripWhatsAppMarkdown(text: string): string {
@@ -234,12 +261,21 @@ function stripWhatsAppMarkdown(text: string): string {
   return out.trim();
 }
 
-function hasClinicGreeting(history: ConversationMessage[]): boolean {
-  return history.some(
-    (m) =>
-      m.role === "assistant" &&
-      /приветствует стоматологическая клиника/i.test(m.content || "")
-  );
+
+function stripRepeatedGreeting(text: string): string {
+  const stripped = text
+    .replace(/^доброе утро[!.\s]*/i, "")
+    .replace(/^добрый день[!.\s]*/i, "")
+    .replace(/^добрый вечер[!.\s]*/i, "")
+    .replace(/^здравствуйте[^\n]*\n+/i, "")
+    .replace(/^вас приветствует стоматологическая клиника[^\n]*\n+/i, "")
+    .replace(/^вижу вы уже обращались к нам[^\n]*\n+/i, "")
+    .replace(/^вы уже посещали нашу клинику[^\n]*\n+/i, "")
+    .replace(/^могу вам чем-нибудь помочь[^\n?]*\??\s*/i, "")
+    .replace(/^чем мы можем вам помочь[^\n?]*\??\s*/i, "")
+    .replace(/^чем могу помочь[^\n?]*\??\s*/i, "")
+    .trim();
+  return stripped || text;
 }
 
 function parsePreferredTime(text: string): string | null {
@@ -251,11 +287,22 @@ function parsePreferredTime(text: string): string | null {
       return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
     }
   }
-  const hourOnly = text.match(/(?:^|в|на)\s*(\d{1,2})\s*(?:час(?:а|ов)?|утра|дня|вечера)?\s*$/i)
-    || text.match(/\b(?:в|на)\s+(\d{1,2})\b/i);
-  if (hourOnly) {
-    const h = Number(hourOnly[1]);
-    if (h >= 8 && h <= 21) return `${String(h).padStart(2, "0")}:00`;
+  const eveningCtx = /вечер|к вечеру|ближе к вечеру|поздн/i.test(text);
+  const morningCtx = /утр/i.test(text);
+  const hourMatch =
+    text.match(/\b(?:в|на)\s+(\d{1,2})(?::(\d{2}))?\s*(?:час(?:а|ов)?|утра|дня|вечера)?/i) ||
+    text.match(/\b(\d{1,2})\s*(?:час(?:а|ов)?)\s*(?:вечера)?/i) ||
+    text.match(/(?:^|в|на)\s*(\d{1,2})\s*(?:час(?:а|ов)?|утра|дня|вечера)?\s*$/i);
+  if (hourMatch) {
+    let h = Number(hourMatch[1]);
+    const m = hourMatch[2] ? Number(hourMatch[2]) : 0;
+    // «в 6» без «утра» в контексте записи — обычно 18:00
+    if (h >= 1 && h <= 7 && !morningCtx && (eveningCtx || h <= 9)) {
+      h += 12;
+    }
+    if (h >= 8 && h <= 21 && m <= 59) {
+      return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+    }
   }
   return null;
 }
@@ -289,6 +336,7 @@ function lastFindSlotsPayload(history: ConversationMessage[]): {
   slots: string[];
   date?: string;
   doctor?: string;
+  reschedule_appointment_id?: number;
 } | null {
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i];
@@ -298,9 +346,15 @@ function lastFindSlotsPayload(history: ConversationMessage[]): {
         slots?: string[];
         date?: string;
         doctor?: string;
+        reschedule_appointment_id?: number;
       };
       if (Array.isArray(json.slots)) {
-        return { slots: json.slots, date: json.date, doctor: json.doctor };
+        return {
+          slots: json.slots,
+          date: json.date,
+          doctor: json.doctor,
+          reschedule_appointment_id: json.reschedule_appointment_id,
+        };
       }
     } catch {
       /* skip */
@@ -311,13 +365,19 @@ function lastFindSlotsPayload(history: ConversationMessage[]): {
 
 function isTwoWordFio(text: string): boolean {
   if (/\d/.test(text)) return false;
-  if (/да|нет|запис|консульт|подойд|сред|вторник|понедельник|врач|время|отмен/i.test(text)) {
+  if (/^(к|у|на|в|о)\s+/i.test(text.trim())) return false;
+  if (
+    /да|нет|запис|консульт|подойд|сред|вторник|понедельник|врач|время|отмен|сегодня|завтра|можно|давайте|хочу|хотел|удобн|прийти|вечер|утр|передумал|асель|ержан|ансар|масенов|абдикаримов/i.test(
+      text
+    )
+  ) {
     return false;
   }
+  if (looksLikeDateOnly(text)) return false;
   const parts = text.trim().split(/\s+/).filter(Boolean);
   return (
     parts.length === 2 &&
-    parts.every((w) => /^[A-Za-zА-Яа-яЁёІіҰұҚқҒғӨөҺһ-]+$/.test(w))
+    parts.every((w) => w.length >= 3 && /^[A-Za-zА-Яа-яЁёІіҰұҚқҒғӨөҺһ-]+$/.test(w))
   );
 }
 
@@ -329,6 +389,39 @@ function isOneWordPatronymic(text: string): boolean {
     /^[A-Za-zА-Яа-яЁёІіҰұҚқҒғӨөҺһ-]+$/.test(parts[0]) &&
     !/^(да|нет|ок|хорошо)$/i.test(parts[0])
   );
+}
+
+function parseTimeOfDayPreference(text: string): "evening" | "morning" | null {
+  if (/вечер|ближе к вечеру|поближе к вечеру|к вечеру|хочется к вечеру|не хотелось бы ближе к вечеру|позднее|попозже/i.test(text)) {
+    return "evening";
+  }
+  if (/утр|пораньше|поближе к утру|раньше/i.test(text)) {
+    return "morning";
+  }
+  return null;
+}
+
+function pickEveningSlot(slots: string[]): string | null {
+  const evening = slots.filter((t) => timeToMinutes(t) >= 16 * 60);
+  return evening.at(-1) ?? slots.at(-1) ?? null;
+}
+
+function replyForTimePreference(
+  preference: "evening" | "morning",
+  slots: string[]
+): string | null {
+  if (!slots.length) return null;
+  if (preference === "evening") {
+    const evening = slots.filter((t) => timeToMinutes(t) >= 16 * 60);
+    if (!evening.length) {
+      if (slots.length === 1) {
+        return `К сожалению, на этот день вечером свободных окон нет. Есть ${slots[0]} — вам подойдёт?`;
+      }
+      return `К сожалению, вечером свободных окон нет. Ближайшее время — ${slots.at(-1)}. Подойдёт?`;
+    }
+    return `Вам подойдёт в ${evening.at(-1)}?`;
+  }
+  return `Вам подойдёт в ${slots[0]}?`;
 }
 
 function replyForRequestedTime(
@@ -356,6 +449,116 @@ function textMentionsDoctor(
   });
 }
 
+function historyAwaitingFio(history: ConversationMessage[]): boolean {
+  const last = [...history]
+    .reverse()
+    .find((m) => m.role === "assistant" && m.content);
+  if (!last?.content) return false;
+  return /полное имя|фамилию|отчество|как вас зовут/i.test(last.content);
+}
+
+function historyShowedDoctorList(history: ConversationMessage[]): boolean {
+  return history.some(
+    (m) => m.role === "assistant" && m.content && /к какому врачу/i.test(m.content)
+  );
+}
+
+function normalizeSlotTime(time: string): string {
+  const [h, m] = time.split(":").map(Number);
+  return `${String(h).padStart(2, "0")}:${String(m || 0).padStart(2, "0")}`;
+}
+
+function lastAssistantOfferedSlot(history: ConversationMessage[]): string | null {
+  const last = [...history]
+    .reverse()
+    .find((m) => m.role === "assistant" && m.content);
+  if (!last?.content) return null;
+  const m =
+    last.content.match(/подойдёт в (\d{1,2}:\d{2})/i) ||
+    last.content.match(/предложить (\d{1,2}:\d{2})/i) ||
+    last.content.match(/Могу предложить (\d{1,2}:\d{2})/i) ||
+    last.content.match(/перенести[^?]*на (\d{1,2}:\d{2})/i) ||
+    last.content.match(/на (\d{1,2}:\d{2})\?/i);
+  return m ? normalizeSlotTime(m[1]) : null;
+}
+
+function pushDeterministicToolExchange(
+  history: ConversationMessage[],
+  userText: string,
+  toolName: string,
+  toolArgs: Record<string, unknown>,
+  toolResult: string,
+  assistantReply: string
+): void {
+  const toolCallId = `det-${Date.now()}`;
+  history.push({ role: "user", content: userText });
+  history.push({
+    role: "assistant",
+    content: null,
+    tool_calls: [
+      {
+        id: toolCallId,
+        type: "function",
+        function: {
+          name: toolName,
+          arguments: JSON.stringify(toolArgs),
+        },
+      },
+    ],
+  });
+  history.push({
+    role: "tool",
+    tool_call_id: toolCallId,
+    content: toolResult,
+    name: toolName,
+  });
+  history.push({ role: "assistant", content: assistantReply });
+}
+
+function isSlotRejection(text: string): boolean {
+  return /^(нет|неа|не подходит|не хочу|другое время|другой|позже)\b/i.test(
+    text.trim()
+  );
+}
+
+function isSlotConfirmation(text: string): boolean {
+  return /^(да|ок|окей|ага|угу|хорошо|подойд|давайте|согласен|верно)\b/i.test(
+    text.trim()
+  );
+}
+
+function extractPatientFioFromHistory(
+  history: ConversationMessage[],
+  doctors: { full_name: string }[]
+): string | null {
+  const users = history
+    .filter((m) => m.role === "user" && m.content)
+    .map((m) => m.content!.trim());
+
+  for (let i = users.length - 1; i >= 0; i--) {
+    const parts = users[i].split(/\s+/);
+    if (
+      parts.length === 3 &&
+      !textMentionsDoctor(users[i], doctors) &&
+      parts.every((w) => /^[A-Za-zА-Яа-яЁё-]+$/.test(w))
+    ) {
+      return users[i];
+    }
+  }
+
+  for (let i = users.length - 1; i >= 1; i--) {
+    if (
+      isOneWordPatronymic(users[i]) &&
+      isTwoWordFio(users[i - 1]) &&
+      !textMentionsDoctor(users[i - 1], doctors)
+    ) {
+      return `${users[i - 1]} ${users[i]}`;
+    }
+  }
+
+  return null;
+}
+
 function historyHasChosenDoctor(
   history: ConversationMessage[],
   doctors: { full_name: string }[]
@@ -377,18 +580,123 @@ function formatDoctorChoice(
   const lines = doctors.map(
     (d, i) => `${i + 1}) ${doctorDisplayName(d.full_name)} — ${d.specialization}`
   );
-  return `К какому врачу записать на консультацию?\n${lines.join("\n")}`;
+  return `Спасибо, что обратились и доверились нашей клинике 🫶🏻
+
+У нас самые лучшие специалисты в городе.
+
+Подскажите, к какому врачу вам удобнее записаться?
+
+${lines.join("\n")}`;
+}
+
+function looksLikeRescheduleRequest(text: string): boolean {
+  return /изменить|перенест|перенос|поменять|на другое время|другое время/i.test(
+    text.toLowerCase()
+  );
+}
+
+function historyHasRescheduleIntent(history: ConversationMessage[]): boolean {
+  return history.some(
+    (m) => m.role === "user" && m.content && looksLikeRescheduleRequest(m.content)
+  );
+}
+
+function looksLikeAppointmentLookup(text: string): boolean {
+  const t = text.toLowerCase();
+  if (
+    /мои запис|какие запис|есть ли запись|у меня (была |есть )?запись|записывал|записан[аы]?|уже запис/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  if (/проверить|посмотреть|уточнить|напомнить/i.test(t) && /запис|во сколько|когда/i.test(t)) {
+    return true;
+  }
+  if (/во сколько|в какое время/i.test(t) && /запис|прием|приём|завтра|сегодня/i.test(t)) {
+    return true;
+  }
+  return false;
 }
 
 function wantsNewBooking(text: string): boolean {
-  if (/отмен|перенес|поменять|попозже|проверить запис/i.test(text)) return false;
-  return /запис|консульт|к врачу|какой врач/i.test(text);
+  if (looksLikeAppointmentLookup(text)) return false;
+  if (looksLikeRescheduleRequest(text)) return false;
+  if (/отмен|перенес|поменять|попозже/i.test(text)) return false;
+  return /записаться|запишите|новую запись|хочу запис|можно запис|к врачу|какой врач|консульт/i.test(
+    text
+  );
 }
 
 function looksLikeDateOnly(text: string): boolean {
-  return /^(на\s+)?(понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|сегодня|завтра)\b/i.test(
-    text.trim()
+  const t = text.trim();
+  if (
+    /^(на\s+)?(понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|сегодня|завтра)\b/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  if (/\bна\s+(сегодня|завтра)\b/i.test(t)) return true;
+  if (
+    /\b(сегодня|завтра)\b/i.test(t) &&
+    /^(можно|хочу|на|давайте|запиш|удобн|прийти|могу|есть)/i.test(t)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function weekdayNameToDow(name: string): number | null {
+  const n = name.toLowerCase();
+  if (n.startsWith("понедельник")) return 1;
+  if (n.startsWith("вторник")) return 2;
+  if (n.startsWith("сред")) return 3;
+  if (n.startsWith("четверг")) return 4;
+  if (n.startsWith("пятниц")) return 5;
+  if (n.startsWith("суббот")) return 6;
+  if (n.startsWith("воскресень")) return 0;
+  return null;
+}
+
+function parseRequestedDate(text: string): string | null {
+  const t = text.toLowerCase();
+  if (/\bсегодня\b/.test(t)) return todayIso();
+  if (/\bзавтра\b/.test(t)) return tomorrowIso();
+  const wd = t.match(
+    /\b(понедельник|вторник|сред[ауы]?|четверг|пятниц[ауы]?|суббот[ауы]?|воскресень[ея]?)\b/i
   );
+  if (wd) {
+    const dow = weekdayNameToDow(wd[1]);
+    if (dow != null) return nextIsoDateForWeekday(dow, CLINIC.timezone);
+  }
+  return null;
+}
+
+function resolveDoctorId(
+  text: string,
+  history: ConversationMessage[],
+  doctors: { id: number; full_name: string }[]
+): number | null {
+  const fromText = doctors.find((d) => textMentionsDoctor(text, [d]));
+  if (fromText) return fromText.id;
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.role !== "user" || !m.content) continue;
+    const d = doctors.find((doc) => textMentionsDoctor(m.content!, [doc]));
+    if (d) return d.id;
+  }
+
+  const numPick = [...history]
+    .reverse()
+    .find((m) => m.role === "user" && m.content && /^[123]$/.test(m.content.trim()));
+  if (numPick?.content && historyHasChosenDoctor(history, doctors)) {
+    const idx = Number(numPick.content.trim()) - 1;
+    if (doctors[idx]) return doctors[idx].id;
+  }
+
+  return null;
 }
 
 function historyAskedForBooking(history: ConversationMessage[]): boolean {
@@ -398,6 +706,19 @@ function historyAskedForBooking(history: ConversationMessage[]): boolean {
       m.content &&
       /запис|консульт/i.test(m.content)
   );
+}
+
+function looksLikeAddressQuestion(text: string): boolean {
+  return /адрес|где\s+(вы|находитесь|клиника|расположен)|как\s+(добраться|найти)|где\s+вы\s+находитесь|ваш\s+адрес/i.test(
+    text
+  );
+}
+
+function replyWithClinicAddress(): string {
+  if (CLINIC.address) {
+    return `Мы находимся по адресу: ${CLINIC.address}. Ждём вас!`;
+  }
+  return "К сожалению, я не могу подсказать адрес в чате — уточните, пожалуйста, у администратора клиники.";
 }
 
 export class DialogOrchestrator {
@@ -415,36 +736,158 @@ export class DialogOrchestrator {
     let text = params.text.trim();
 
     if (!text) {
-      return CLINIC_GREETING;
+      return buildNewClientGreeting();
     }
 
     if (/^(сброс|reset|новый диалог)$/i.test(text)) {
+      const greeting = buildNewClientGreeting();
+      await clearConversation(phone);
       await saveConversation(phone, [
         { role: "system", content: systemPrompt() },
-        { role: "assistant", content: CLINIC_GREETING },
+        { role: "assistant", content: greeting },
       ]);
-      return CLINIC_GREETING;
+      await markGreetedToday(phone);
+      return greeting;
     }
 
-    let history = await loadConversation(phone);
-    const greeted = hasClinicGreeting(history);
+    const record = await loadConversationRecord(phone);
+    const firstToday = isFirstContactToday(record.last_greeted_date);
+    let dailyGreeting: string | null = null;
 
-    if (
-      /^(привет|здравствуйте|здравстуйте|добрый\s+(день|вечер|утро)|hello|hi|hey)[\s!.]*$/i.test(
-        text
-      )
-    ) {
-      if (greeted) {
-        return stripWhatsAppMarkdown(
-          "Чем могу помочь: запись, перенос или отмена?"
-        );
+    if (firstToday) {
+      const returning = await isReturningClient(phone);
+      dailyGreeting = buildDailyGreeting(returning);
+      await markGreetedToday(phone);
+
+      if (isGreetingOnly(text)) {
+        await saveConversation(phone, [
+          { role: "system", content: systemPrompt() },
+          { role: "user", content: text },
+          { role: "assistant", content: dailyGreeting },
+        ]);
+        return dailyGreeting;
       }
-      await saveConversation(phone, [
-        { role: "system", content: systemPrompt() },
-        { role: "user", content: text },
-        { role: "assistant", content: CLINIC_GREETING },
-      ]);
-      return CLINIC_GREETING;
+    }
+
+    const finalize = (body: string, stripGreeting = true): string => {
+      const combined = dailyGreeting
+        ? prependDailyGreeting(dailyGreeting, body)
+        : body;
+      const cleaned = stripGreeting ? stripRepeatedGreeting(combined) : combined;
+      return stripWhatsAppMarkdown(cleaned);
+    };
+
+    let history = record.messages;
+    const greetedToday = Boolean(dailyGreeting) || !firstToday;
+
+    if (looksLikeAddressQuestion(text)) {
+      const reply = replyWithClinicAddress();
+      if (history.length === 0) {
+        history = [{ role: "system", content: systemPrompt() }];
+      }
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+      await saveConversation(phone, history);
+      return finalize(reply);
+    }
+
+    if (isGreetingOnly(text)) {
+      const reply =
+        "Чем могу помочь? Запишу на приём, проверю вашу запись или подскажу адрес клиники 😊";
+      if (history.length === 0) {
+        history = [{ role: "system", content: systemPrompt() }];
+      }
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+      await saveConversation(phone, history);
+      return finalize(reply);
+    }
+
+    if (looksLikeAppointmentLookup(text)) {
+      const list = await this.booking.getPatientAppointments(phone);
+      const targetDate = parseRequestedDate(text);
+      const filtered = targetDate
+        ? list.filter(
+            (a) => formatDateInTz(a.starts_at, CLINIC.timezone) === targetDate
+          )
+        : list;
+      const reply = formatAppointmentLookupReply(filtered, targetDate);
+      if (history.length === 0) {
+        history = [{ role: "system", content: systemPrompt() }];
+      }
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+      await saveConversation(phone, history);
+      return finalize(reply);
+    }
+
+    if (looksLikeRescheduleRequest(text)) {
+      const list = await this.booking.getPatientAppointments(phone);
+      if (!list.length) {
+        const reply =
+          "Не нашёл активных записей для переноса. Хотите записаться на приём?";
+        if (history.length === 0) {
+          history = [{ role: "system", content: systemPrompt() }];
+        }
+        history.push({ role: "user", content: text });
+        history.push({ role: "assistant", content: reply });
+        await saveConversation(phone, history);
+        return finalize(reply);
+      }
+
+      const appt =
+        list.find(
+          (a) =>
+            parseRequestedDate(text) &&
+            formatDateInTz(a.starts_at, CLINIC.timezone) === parseRequestedDate(text)
+        ) ?? list[0];
+      const date = formatDateInTz(appt.starts_at, CLINIC.timezone);
+      const oldTime = formatTimeInTz(appt.starts_at, CLINIC.timezone);
+      const preferred = parsePreferredTime(text);
+
+      try {
+        const result = await this.booking.findSlots({
+          doctorId: appt.doctor_id,
+          date,
+          serviceId: appt.service_id,
+        });
+        let reply: string;
+        if (!result.slots.length) {
+          reply = `К сожалению, на ${formatDateHumanRu(date)} нет свободных окон для переноса. Подобрать другой день?`;
+        } else if (preferred) {
+          const pick = pickSuggestedSlot(result.slots, preferred);
+          if (pick.requested_free) {
+            reply = `Конечно! Перенести вашу запись с ${oldTime} на ${preferred}?`;
+          } else if (pick.suggested) {
+            reply = `${preferred} занято. Могу перенести на ${pick.suggested} — подойдёт?`;
+          } else {
+            reply = `На этот день свободных окон нет. Подобрать другой день?`;
+          }
+        } else {
+          reply = `Сейчас у вас запись в ${oldTime}. На какое время перенести?`;
+        }
+
+        const toolPayload = JSON.stringify({
+          ...result,
+          slots: result.slots,
+          reschedule_appointment_id: appt.id,
+        });
+        if (history.length === 0) {
+          history = [{ role: "system", content: systemPrompt() }];
+        }
+        pushDeterministicToolExchange(
+          history,
+          text,
+          "find_slots",
+          { doctor_id: appt.doctor_id, date, service_id: appt.service_id },
+          toolPayload,
+          reply
+        );
+        await saveConversation(phone, history);
+        return finalize(reply);
+      } catch (err) {
+        console.error("deterministic reschedule find_slots failed", err);
+      }
     }
 
     const doctors = await this.booking.listDoctors();
@@ -463,44 +906,226 @@ export class DialogOrchestrator {
       history.push({ role: "user", content: text });
       history.push({ role: "assistant", content: reply });
       await saveConversation(phone, history);
-      return reply;
+      return finalize(reply);
+    }
+
+    const prevSlots = lastFindSlotsPayload(history);
+
+    if (
+      textMentionsDoctor(text, doctors) &&
+      !looksLikeDateOnly(text) &&
+      !historyAwaitingFio(history) &&
+      (historyShowedDoctorList(history) || /передумал|другого врача/i.test(text))
+    ) {
+      const doctorId = resolveDoctorId(text, history, doctors);
+      const doc = doctors.find((d) => d.id === doctorId);
+      if (doc) {
+        const reply = `Замечательно! Когда вам было бы удобно прийти к ${doctorDisplayName(doc.full_name)}?`;
+        if (history.length === 0) {
+          history = [{ role: "system", content: systemPrompt() }];
+        }
+        history.push({ role: "user", content: text });
+        history.push({ role: "assistant", content: reply });
+        await saveConversation(phone, history);
+        return finalize(reply);
+      }
+    }
+
+    if (doctorChosen && looksLikeDateOnly(text)) {
+      const doctorId = resolveDoctorId(text, history, doctors);
+      const date = parseRequestedDate(text);
+      if (doctorId && date) {
+        if (!isDateBookable(date)) {
+          const reply = `К сожалению, на сегодня уже нельзя записаться — ближайшая дата ${earliestBookableDateIso()}. Какой день вам удобнее?`;
+          if (history.length === 0) {
+            history = [{ role: "system", content: systemPrompt() }];
+          }
+          history.push({ role: "user", content: text });
+          history.push({ role: "assistant", content: reply });
+          await saveConversation(phone, history);
+          return finalize(reply);
+        }
+        try {
+          const result = await this.booking.findSlots({ doctorId, date });
+          const preferred = parsePreferredTime(text);
+          const timePref = parseTimeOfDayPreference(text);
+          let reply: string;
+          if (!result.slots.length) {
+            reply = `К сожалению, на этот день у врача нет свободных окон. Подобрать другой день?`;
+          } else if (timePref) {
+            reply =
+              replyForTimePreference(timePref, result.slots) ??
+              `Вам подойдёт в ${result.slots[0]}?`;
+          } else if (preferred) {
+            reply = replyForRequestedTime(preferred, result.slots);
+          } else {
+            const pick = pickSuggestedSlot(result.slots, null);
+            reply = `Вам подойдёт в ${pick.suggested}?`;
+          }
+          const toolPayload = JSON.stringify({
+            ...result,
+            slots: result.slots,
+            slots_total: result.slots.length,
+          });
+          if (history.length === 0) {
+            history = [{ role: "system", content: systemPrompt() }];
+          }
+          pushDeterministicToolExchange(
+            history,
+            text,
+            "find_slots",
+            { doctor_id: doctorId, date },
+            toolPayload,
+            reply
+          );
+          await saveConversation(phone, history);
+          return finalize(reply);
+        } catch (err) {
+          console.error("deterministic find_slots failed", err);
+        }
+      }
     }
 
     const lastUser = [...history].reverse().find((m) => m.role === "user" && m.content);
-    if (isOneWordPatronymic(text) && lastUser?.content && isTwoWordFio(lastUser.content)) {
+    if (
+      isOneWordPatronymic(text) &&
+      lastUser?.content &&
+      isTwoWordFio(lastUser.content) &&
+      historyAwaitingFio(history)
+    ) {
       text = `${lastUser.content.trim()} ${text.trim()}`;
-    } else if (isTwoWordFio(text)) {
+    } else if (
+      isTwoWordFio(text) &&
+      !textMentionsDoctor(text, doctors) &&
+      historyAwaitingFio(history)
+    ) {
       const reply =
-        "Напишите ещё отчество, как в удостоверении (три слова: фамилия, имя, отчество).";
+        "Спасибо! А подскажите ещё отчество — нужно для оформления записи.";
+      if (history.length === 0) {
+        history = [{ role: "system", content: systemPrompt() }];
+      }
       history.push({ role: "user", content: text });
       history.push({ role: "assistant", content: reply });
       await saveConversation(phone, history);
-      return reply;
+      return finalize(reply);
+    }
+
+    const offeredSlot = lastAssistantOfferedSlot(history);
+    if (isSlotRejection(text) && prevSlots?.slots?.length && offeredSlot) {
+      const remaining = prevSlots.slots.filter(
+        (t) => normalizeSlotTime(t) !== offeredSlot
+      );
+      const reply = remaining.length
+        ? `Хорошо, понял. Тогда вам подойдёт в ${remaining[0]}?`
+        : `На этот день других свободных окон нет. Подобрать другой день?`;
+      if (history.length === 0) {
+        history = [{ role: "system", content: systemPrompt() }];
+      }
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+      await saveConversation(phone, history);
+      return finalize(reply);
+    }
+
+    if (isSlotConfirmation(text) && offeredSlot && prevSlots?.date) {
+      const slotOk = prevSlots.slots.some(
+        (t) => normalizeSlotTime(t) === offeredSlot
+      );
+      let apptId = prevSlots.reschedule_appointment_id;
+      if (!apptId && historyHasRescheduleIntent(history)) {
+        const list = await this.booking.getPatientAppointments(phone);
+        const match = list.find(
+          (a) => formatDateInTz(a.starts_at, CLINIC.timezone) === prevSlots.date
+        );
+        apptId = match?.id;
+      }
+
+      if (apptId && slotOk) {
+        try {
+          const moved = await this.booking.rescheduleAppointment({
+            appointmentId: apptId,
+            phone,
+            date: prevSlots.date,
+            time: offeredSlot,
+          });
+          const reply = formatRescheduleConfirmation({
+            doctorName: moved.doctor_name ?? "врачу",
+            date: prevSlots.date,
+            time: offeredSlot,
+          });
+          if (history.length === 0) {
+            history = [{ role: "system", content: systemPrompt() }];
+          }
+          history.push({ role: "user", content: text });
+          history.push({ role: "assistant", content: reply });
+          await saveConversation(phone, history);
+          return finalize(reply);
+        } catch (err) {
+          const reply =
+            err instanceof BookingError
+              ? err.message
+              : "Не удалось перенести запись. Попробуйте ещё раз.";
+          if (history.length === 0) {
+            history = [{ role: "system", content: systemPrompt() }];
+          }
+          history.push({ role: "user", content: text });
+          history.push({ role: "assistant", content: reply });
+          await saveConversation(phone, history);
+          return finalize(reply);
+        }
+      }
+
+      const fio = extractPatientFioFromHistory(history, doctors);
+      const doctorId = resolveDoctorId(text, history, doctors);
+      const doc = doctors.find((d) => d.id === doctorId);
+      if (fio && doc && slotOk) {
+        const reply = `Отлично! Подтвердите, пожалуйста: ${fio}, врач ${doctorDisplayName(doc.full_name)}, ${prevSlots.date} в ${offeredSlot}. Всё верно?`;
+        if (history.length === 0) {
+          history = [{ role: "system", content: systemPrompt() }];
+        }
+        history.push({ role: "user", content: text });
+        history.push({ role: "assistant", content: reply });
+        await saveConversation(phone, history);
+        return finalize(reply);
+      }
     }
 
     const askedTime = parsePreferredTime(text);
-    const prevSlots = lastFindSlotsPayload(history);
+    const timePref = parseTimeOfDayPreference(text);
+    if (
+      timePref &&
+      prevSlots?.slots?.length &&
+      !/^(да|хорошо|ок|подойд)/i.test(text.trim())
+    ) {
+      const reply = replyForTimePreference(timePref, prevSlots.slots);
+      if (reply) {
+        if (history.length === 0) {
+          history = [{ role: "system", content: systemPrompt() }];
+        }
+        history.push({ role: "user", content: text });
+        history.push({ role: "assistant", content: reply });
+        await saveConversation(phone, history);
+        return finalize(reply);
+      }
+    }
     if (
       askedTime &&
       prevSlots?.slots?.length &&
       !/^(да|хорошо|ок|подойд)/i.test(text.trim())
     ) {
       const reply = replyForRequestedTime(askedTime, prevSlots.slots);
+      if (history.length === 0) {
+        history = [{ role: "system", content: systemPrompt() }];
+      }
       history.push({ role: "user", content: text });
       history.push({ role: "assistant", content: reply });
       await saveConversation(phone, history);
-      return reply;
+      return finalize(reply);
     }
 
-    const isNewDialog =
-      !greeted &&
-      (history.length === 0 || history.every((m) => m.role === "system"));
-
-    const prompt = greeted
-      ? `${systemPrompt()}\n\nВ этом диалоге ты УЖЕ поздоровался. Не пиши «Здравствуйте» и не повторяй шапку клиники.`
-      : isNewDialog
-        ? `${systemPrompt()}\n\nСейчас ПЕРВОЕ сообщение пациента. Один раз поприветствуй клинику (шаг A), затем сразу продолжай запись.`
-        : systemPrompt();
+    const prompt = greetedToday
+      ? `${systemPrompt()}\n\nСегодня ты УЖЕ поздоровался с пациентом. Не повторяй приветствие и шапку клиники.`
+      : systemPrompt();
 
     if (history.length === 0) {
       history.push({ role: "system", content: prompt });
@@ -561,6 +1186,39 @@ export class DialogOrchestrator {
             content: result,
             name: toolCall.function.name,
           });
+
+          if (toolCall.function.name === "book_appointment") {
+            try {
+              const parsed = JSON.parse(result) as {
+                ok?: boolean;
+                confirmation_message?: string;
+              };
+              if (parsed.ok && parsed.confirmation_message) {
+                finalText = parsed.confirmation_message;
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+          if (toolCall.function.name === "reschedule_appointment") {
+            try {
+              const parsed = JSON.parse(result) as {
+                ok?: boolean;
+                confirmation_message?: string;
+              };
+              if (parsed.ok && parsed.confirmation_message) {
+                finalText = parsed.confirmation_message;
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+
+        if (finalText) {
+          history.push({ role: "assistant", content: finalText });
+          messages.push({ role: "assistant", content: finalText });
+          break;
         }
         continue;
       }
@@ -568,7 +1226,7 @@ export class DialogOrchestrator {
       finalText =
         choice.content?.trim() ||
         "Готово. Если нужно что-то ещё — напишите.";
-      if (greeted) {
+      if (greetedToday) {
         finalText = stripRepeatedGreeting(finalText);
       }
       history.push({ role: "assistant", content: finalText });
@@ -582,9 +1240,7 @@ export class DialogOrchestrator {
     }
 
     await saveConversation(phone, history);
-    return stripWhatsAppMarkdown(
-      greeted ? stripRepeatedGreeting(finalText) : finalText
-    );
+    return finalize(finalText, false);
   }
 
   private async executeTool(
@@ -609,6 +1265,14 @@ export class DialogOrchestrator {
           );
         }
         case "find_slots": {
+          const date = String(args.date);
+          if (!isDateBookable(date)) {
+            const earliest = earliestBookableDateIso();
+            return JSON.stringify({
+              error: `Запись на ${date} недоступна. Ближайшая дата: ${earliest}.`,
+              earliest_bookable_date: earliest,
+            });
+          }
           const result = await this.booking.findSlots({
             doctorId: Number(args.doctor_id),
             serviceId:
@@ -663,8 +1327,14 @@ export class DialogOrchestrator {
             time: String(args.time),
             comment: args.comment ? String(args.comment) : undefined,
           });
+          const confirmation_message = formatBookingConfirmation({
+            doctorName: appt.doctor_name ?? "врачу",
+            date: String(args.date),
+            time: String(args.time),
+          });
           return JSON.stringify({
             ok: true,
+            confirmation_message,
             appointment: {
               id: appt.id,
               patient_name: appt.patient_name,
@@ -700,8 +1370,14 @@ export class DialogOrchestrator {
             date: String(args.date),
             time: String(args.time),
           });
+          const confirmation_message = formatRescheduleConfirmation({
+            doctorName: appt.doctor_name ?? "врачу",
+            date: String(args.date),
+            time: String(args.time),
+          });
           return JSON.stringify({
             ok: true,
+            confirmation_message,
             appointment: {
               id: appt.id,
               starts_at: appt.starts_at.toISOString(),
@@ -739,31 +1415,42 @@ export class DialogOrchestrator {
 function toOpenAIMessages(
   history: ConversationMessage[]
 ): ChatCompletionMessageParam[] {
-  return history.map((m) => {
+  const out: ChatCompletionMessageParam[] = [];
+  for (let i = 0; i < history.length; i++) {
+    const m = history[i];
     if (m.role === "tool") {
-      return {
-        role: "tool" as const,
+      const prev = history[i - 1];
+      if (!prev || prev.role !== "assistant" || !prev.tool_calls) {
+        continue;
+      }
+      out.push({
+        role: "tool",
         tool_call_id: m.tool_call_id || "",
         content: m.content || "",
-      };
+      });
+      continue;
     }
     if (m.role === "assistant" && m.tool_calls) {
-      return {
-        role: "assistant" as const,
+      out.push({
+        role: "assistant",
         content: m.content,
         tool_calls: m.tool_calls as ChatCompletionMessageParam extends never
           ? never
           : NonNullable<
               Extract<ChatCompletionMessageParam, { role: "assistant" }>["tool_calls"]
             >,
-      };
+      });
+      continue;
     }
     if (m.role === "system") {
-      return { role: "system" as const, content: m.content || "" };
+      out.push({ role: "system", content: m.content || "" });
+      continue;
     }
     if (m.role === "user") {
-      return { role: "user" as const, content: m.content || "" };
+      out.push({ role: "user", content: m.content || "" });
+      continue;
     }
-    return { role: "assistant" as const, content: m.content || "" };
-  });
+    out.push({ role: "assistant", content: m.content || "" });
+  }
+  return out;
 }
