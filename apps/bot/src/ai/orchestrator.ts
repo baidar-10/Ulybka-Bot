@@ -8,8 +8,8 @@ import { CLINIC } from "../config/hours.js";
 import {
   BookingError,
   BookingService,
-  normalizePhone,
 } from "../booking/service.js";
+import { normalizePhone } from "../booking/phone.js";
 import {
   clearConversation,
   isFirstContactToday,
@@ -18,7 +18,9 @@ import {
   markGreetedToday,
   saveConversation,
 } from "../db/conversations.js";
+import { getKnownPatient } from "../db/patients.js";
 import type { ConversationMessage } from "../db/types.js";
+import { doctorNameInDative } from "./doctor-names.js";
 import { doctorDisplayName, nameTokens, normalizeName } from "../macdent/parse.js";
 import { formatDateInTz, formatTimeInTz, nextIsoDateForWeekday } from "../booking/slots.js";
 import {
@@ -33,9 +35,16 @@ import {
   formatRescheduleConfirmation,
 } from "./booking-messages.js";
 import {
+  formatProcedureQuestion,
+  listProcedures,
+  PROCEDURES,
+  resolveProcedureFromClientText,
+  textDescribesProcedure,
+} from "../booking/procedures.js";
+import {
+  bookingPolicyText,
   earliestBookableDateIso,
   isDateBookable,
-  sameDayBookingRuleText,
   todayIso,
   tomorrowIso,
 } from "../booking/policy.js";
@@ -47,6 +56,15 @@ const tools: ChatCompletionTool[] = [
       name: "list_doctors",
       description:
         "Список всех врачей. Перед вопросом «какой врач» вызови этот метод и перечисли пациенту ВСЕХ из ответа, никого не пропускай.",
+      parameters: { type: "object", properties: {}, additionalProperties: false },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "list_procedures",
+      description:
+        "Внутренний справочник процедур с длительностью. НЕ перечисляй пациенту. Спроси открытым вопросом «на какую процедуру хотите записаться?», затем сопоставь ответ с procedure_type.",
       parameters: { type: "object", properties: {}, additionalProperties: false },
     },
   },
@@ -70,15 +88,23 @@ const tools: ChatCompletionTool[] = [
     function: {
       name: "find_slots",
       description:
-        "Проверка свободного времени врача на дату. После ответа предложи пациенту ОДНО время из suggested. Не перечисляй список слотов.",
+        "Проверка свободного времени врача на дату. Вызывай после ответа клиента о процедуре (procedure_type + visit_reason). Не перечисляй слоты — предложи одно время.",
       parameters: {
         type: "object",
         properties: {
           doctor_id: { type: "integer" },
-          service_id: { type: "integer" },
+          procedure_type: {
+            type: "string",
+            description: "ID процедуры для расчёта слотов (consultation, treatment, …)",
+          },
+          visit_reason: {
+            type: "string",
+            description: "Причина обращения — формулировка клиента, попадает в MacDent",
+          },
+          service_id: { type: "integer", description: "Устарело, используй procedure_type" },
           date: { type: "string", description: "YYYY-MM-DD" },
         },
-        required: ["doctor_id", "date"],
+        required: ["doctor_id", "procedure_type", "visit_reason", "date"],
         additionalProperties: false,
       },
     },
@@ -88,7 +114,7 @@ const tools: ChatCompletionTool[] = [
     function: {
       name: "book_appointment",
       description:
-        "Создать запись. Вызывать ТОЛЬКО после явного подтверждения пациентом (да/подтверждаю), когда известны фамилия имя отчество, врач, услуга, дата и время.",
+        "Создать запись. Вызывать ТОЛЬКО после явного подтверждения пациентом (да/подтверждаю), когда известны ФИО, врач, тип процедуры, дата и время. В MacDent поле «Причина обращения» заполнится типом процедуры.",
       parameters: {
         type: "object",
         properties: {
@@ -97,15 +123,27 @@ const tools: ChatCompletionTool[] = [
             description: "Полное ФИО пациента: фамилия, имя, отчество",
           },
           doctor_id: { type: "integer" },
-          service_id: { type: "integer" },
+          procedure_type: {
+            type: "string",
+            description: "ID процедуры для расчёта слотов",
+          },
+          visit_reason: {
+            type: "string",
+            description: "Причина обращения — слова клиента",
+          },
+          service_id: { type: "integer", description: "Устарело, используй procedure_type" },
           date: { type: "string", description: "YYYY-MM-DD" },
           time: { type: "string", description: "HH:MM" },
-          comment: { type: "string" },
+          comment: {
+            type: "string",
+            description: "То же, что visit_reason (причина обращения в MacDent)",
+          },
         },
         required: [
           "patient_name",
           "doctor_id",
-          "service_id",
+          "procedure_type",
+          "visit_reason",
           "date",
           "time",
         ],
@@ -198,31 +236,33 @@ function systemPrompt(): string {
 Ближайшие дни (для find_slots.date): ${upcoming}
 Часы: Пн–Пт 10:00–20:00, Сб–Вс 10:00–14:00
 ${CLINIC.address ? `Адрес клиники (только этот, никогда не выдумывай другой): ${CLINIC.address}` : "Адрес клиники в системе не задан — при вопросе об адресе скажи, что уточните у администратора."}
-${sameDayBookingRuleText()}
+${bookingPolicyText()}
 
-Врачи — ВСЕГДА все трое:
-1) Абдикаримова Асель — ортодонт, терапевт
-2) Абдикаримов Ержан — терапевт, хирург, ортопед
-3) Масенов Ансар — терапевт, хирург, ортопед
-Нельзя предлагать только двоих.
+Врачи — ВСЕГДА все трое (в списке — дательный падеж, т.к. «к какому врачу»):
+1) Абдикаримовой Асель — ортодонт, терапевт
+2) Абдикаримову Ержану — терапевт, хирург, ортопед
+3) Масенову Ансару — терапевт, хирург, ортопед
+Нельзя предлагать только двоих. После «к» всегда склоняй имя: к Абдикаримовой Асель, к Ержану, к Ансару.
 
 Направление:
 - брекеты, элайнеры, прикус, ортодонтия → Асель
 - удаление, имплант, хирургия, протез, коронка, ортопедия → Ержан или Ансар
 - кариес, каналы, чистка, боль, консультация терапевта → любой из троих (Асель тоже терапевт)
 
+Типы процедур (list_procedures — только для тебя, пациенту НЕ перечисляй):
+consultation, treatment, cleaning, correction, crowns, crown_correction, extraction, implantation, suture_removal, braces_install.
+Длительность и ограничения по времени учитываются в find_slots автоматически.
+
 === Порядок записи (строго, не прыгай через шаги) ===
-1) Пока врач не выбран — сначала тепло: «Спасибо, что обратились и доверились нашей клинике 🫶🏻» Затем список всех врачей и вопрос «К какому врачу вам удобнее записаться?». Не спрашивай дату. Не вызывай find_slots.
-2) Врач выбран — тогда по-дружески: «Когда вам было бы удобно прийти?» или «На какую дату записать?»
-3) Дата есть — вызови find_slots. Если пациент уже назвал время — смотри requested_free.
-   Свободно: «Вам подойдёт в {это время}?»
-   Занято: «К сожалению, {время} уже занято. Могу предложить {suggested} — подойдёт?» suggested — ближайшее к запросу.
-   Не показывай список. Не пиши «перенос» на новую запись.
-   Если пациент говорит «нет» на предложенное время — это отказ от времени, НЕ «занято». Предложи другое свободное время.
-4) Время подтверждено — тепло попроси ФИО: «Отлично! Подскажите, пожалуйста, ваше полное имя — фамилию, имя и отчество.»
-   Если дали только фамилию и имя — мягко: «Спасибо! А подскажите ещё отчество — нужно для оформления записи.»
-   book_appointment только с тремя словами в ФИО.
-5) ФИО есть — кратко переспроси запись и жди «да» → book_appointment. После успешной записи отправь пациенту confirmation_message из ответа tool без изменений.
+1) Пока врач не выбран — список врачей. Не спрашивай дату и процедуру. Не вызывай find_slots.
+2) Врач выбран — спроси ОТКРЫТЫМ вопросом: «На какую процедуру вы хотите записаться?» Без списка вариантов. Не вызывай find_slots.
+3) Клиент назвал процедуру — запомни его формулировку как visit_reason (причина обращения в MacDent). Сопоставь с procedure_type через list_procedures. Спроси дату.
+4) Дата есть — find_slots с procedure_type и visit_reason. Слоты подбираются автоматически.
+   Свободно: «Вам подойдёт в {время}?» Занято: предложи suggested. Без списка слотов.
+   Не сообщай пациенту длительность и внутренние ограничения.
+5) Время подтверждено — если ФИО уже в системе, не спрашивай. Иначе попроси ФИО.
+6) ФИО известно — переспроси запись и жди «да» → book_appointment с procedure_type и visit_reason (comment = visit_reason).
+   После успешной записи отправь пациенту confirmation_message из ответа tool без изменений.
 
 Запрещено нумеровать слоты (1) 10:00 2) 10:30 …). Запрещено писать «подтверждаете перенос», если это новая запись.
 
@@ -336,6 +376,9 @@ function lastFindSlotsPayload(history: ConversationMessage[]): {
   slots: string[];
   date?: string;
   doctor?: string;
+  procedure_type?: string;
+  procedure_label?: string;
+  visit_reason?: string;
   reschedule_appointment_id?: number;
 } | null {
   for (let i = history.length - 1; i >= 0; i--) {
@@ -346,6 +389,9 @@ function lastFindSlotsPayload(history: ConversationMessage[]): {
         slots?: string[];
         date?: string;
         doctor?: string;
+        procedure_type?: string;
+        procedure_label?: string;
+        visit_reason?: string;
         reschedule_appointment_id?: number;
       };
       if (Array.isArray(json.slots)) {
@@ -353,6 +399,9 @@ function lastFindSlotsPayload(history: ConversationMessage[]): {
           slots: json.slots,
           date: json.date,
           doctor: json.doctor,
+          procedure_type: json.procedure_type,
+          procedure_label: json.procedure_label,
+          visit_reason: json.visit_reason,
           reschedule_appointment_id: json.reschedule_appointment_id,
         };
       }
@@ -367,7 +416,7 @@ function isTwoWordFio(text: string): boolean {
   if (/\d/.test(text)) return false;
   if (/^(к|у|на|в|о)\s+/i.test(text.trim())) return false;
   if (
-    /да|нет|запис|консульт|подойд|сред|вторник|понедельник|врач|время|отмен|сегодня|завтра|можно|давайте|хочу|хотел|удобн|прийти|вечер|утр|передумал|асель|ержан|ансар|масенов|абдикаримов/i.test(
+    /да|нет|запис|консульт|подойд|сред|вторник|понедельник|врач|время|отмен|сегодня|завтра|можно|давайте|хочу|хотел|удобн|прийти|вечер|утр|передумал|асель|ержан|ансар|масенов|абдикаримов|лечение|чистк|имплант|брекет|корон|удален|шов|коррекц/i.test(
       text
     )
   ) {
@@ -447,6 +496,14 @@ function textMentionsDoctor(
     const tokens = nameTokens(d.full_name).filter((t) => t.length >= 4);
     return tokens.some((t) => n.includes(t));
   });
+}
+
+function historyAwaitingFinalConfirmation(history: ConversationMessage[]): boolean {
+  const last = [...history]
+    .reverse()
+    .find((m) => m.role === "assistant" && m.content);
+  if (!last?.content) return false;
+  return /всё верно/i.test(last.content);
 }
 
 function historyAwaitingFio(history: ConversationMessage[]): boolean {
@@ -578,7 +635,8 @@ function formatDoctorChoice(
   doctors: { full_name: string; specialization: string }[]
 ): string {
   const lines = doctors.map(
-    (d, i) => `${i + 1}) ${doctorDisplayName(d.full_name)} — ${d.specialization}`
+    (d, i) =>
+      `${i + 1}) ${doctorNameInDative(d.full_name)} — ${d.specialization}`
   );
   return `Спасибо, что обратились и доверились нашей клинике 🫶🏻
 
@@ -587,6 +645,117 @@ function formatDoctorChoice(
 Подскажите, к какому врачу вам удобнее записаться?
 
 ${lines.join("\n")}`;
+}
+
+function historyAskedProcedure(history: ConversationMessage[]): boolean {
+  return history.some(
+    (m) =>
+      m.role === "assistant" &&
+      m.content &&
+      /на какую процедуру|какую процедуру/i.test(m.content)
+  );
+}
+
+function looksLikeProcedureAnswer(text: string): boolean {
+  const t = text.trim();
+  if (!t || t.length < 2) return false;
+  if (looksLikeDateOnly(text)) return false;
+  if (/^(да|нет|ок|1|2|3)$/i.test(t)) return false;
+  return true;
+}
+
+function extractProcedureAnswerFromHistory(
+  history: ConversationMessage[],
+  currentText?: string
+): string | null {
+  if (currentText && looksLikeProcedureAnswer(currentText)) {
+    return currentText.trim();
+  }
+  if (!historyAskedProcedure(history)) return null;
+  let askedIdx = -1;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (
+      m.role === "assistant" &&
+      m.content &&
+      /на какую процедуру|какую процедуру/i.test(m.content)
+    ) {
+      askedIdx = i;
+      break;
+    }
+  }
+  if (askedIdx < 0) return null;
+  for (let i = askedIdx + 1; i < history.length; i++) {
+    const m = history[i];
+    if (m.role === "user" && m.content && looksLikeProcedureAnswer(m.content)) {
+      return m.content.trim();
+    }
+  }
+  return null;
+}
+
+function resolveProcedureIntent(
+  text: string,
+  history: ConversationMessage[]
+): { procedureType: string; visitReason: string } | null {
+  const answer =
+    extractProcedureAnswerFromHistory(history, text) ??
+    (looksLikeProcedureAnswer(text) ? text.trim() : null);
+  if (!answer) {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const m = history[i];
+      if (m.role === "tool" && m.name === "find_slots" && m.content) {
+        try {
+          const json = JSON.parse(m.content) as {
+            procedure_type?: string;
+            visit_reason?: string;
+          };
+          if (json.procedure_type && json.visit_reason) {
+            return {
+              procedureType: json.procedure_type,
+              visitReason: json.visit_reason,
+            };
+          }
+        } catch {
+          /* skip */
+        }
+      }
+    }
+    return null;
+  }
+  const resolved = resolveProcedureFromClientText(answer);
+  if (!resolved) return null;
+  return {
+    procedureType: resolved.procedure.id,
+    visitReason: resolved.visitReason,
+  };
+}
+
+function historyHasChosenProcedure(history: ConversationMessage[]): boolean {
+  if (extractProcedureAnswerFromHistory(history)) return true;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i];
+    if (m.role === "tool" && m.name === "find_slots" && m.content) {
+      try {
+        const json = JSON.parse(m.content) as { procedure_type?: string };
+        if (json.procedure_type) return true;
+      } catch {
+        /* skip */
+      }
+    }
+  }
+  return false;
+}
+
+function inNewBookingFlow(history: ConversationMessage[]): boolean {
+  return (
+    history.some(
+      (m) =>
+        (m.role === "user" || m.role === "assistant") &&
+        m.content &&
+        /запис|консульт|прием|приём/i.test(m.content)
+    ) || historyShowedDoctorList(history)
+  );
 }
 
 function looksLikeRescheduleRequest(text: string): boolean {
@@ -751,6 +920,7 @@ export class DialogOrchestrator {
     }
 
     const record = await loadConversationRecord(phone);
+    const knownPatient = await getKnownPatient(phone);
     const firstToday = isFirstContactToday(record.last_greeted_date);
     let dailyGreeting: string | null = null;
 
@@ -770,11 +940,11 @@ export class DialogOrchestrator {
     }
 
     const finalize = (body: string, stripGreeting = true): string => {
+      const cleanedBody = stripGreeting ? stripRepeatedGreeting(body) : body;
       const combined = dailyGreeting
-        ? prependDailyGreeting(dailyGreeting, body)
-        : body;
-      const cleaned = stripGreeting ? stripRepeatedGreeting(combined) : combined;
-      return stripWhatsAppMarkdown(cleaned);
+        ? prependDailyGreeting(dailyGreeting, cleanedBody)
+        : cleanedBody;
+      return stripWhatsAppMarkdown(combined);
     };
 
     let history = record.messages;
@@ -920,7 +1090,17 @@ export class DialogOrchestrator {
       const doctorId = resolveDoctorId(text, history, doctors);
       const doc = doctors.find((d) => d.id === doctorId);
       if (doc) {
-        const reply = `Замечательно! Когда вам было бы удобно прийти к ${doctorDisplayName(doc.full_name)}?`;
+        if (textDescribesProcedure(text) && !looksLikeDateOnly(text)) {
+          const reply = "Отлично! Когда вам было бы удобно прийти?";
+          if (history.length === 0) {
+            history = [{ role: "system", content: systemPrompt() }];
+          }
+          history.push({ role: "user", content: text });
+          history.push({ role: "assistant", content: reply });
+          await saveConversation(phone, history);
+          return finalize(reply);
+        }
+        const reply = `Замечательно! ${formatProcedureQuestion()}`;
         if (history.length === 0) {
           history = [{ role: "system", content: systemPrompt() }];
         }
@@ -931,10 +1111,60 @@ export class DialogOrchestrator {
       }
     }
 
+    if (
+      doctorChosen &&
+      !historyHasChosenProcedure(history) &&
+      !looksLikeDateOnly(text) &&
+      !historyAwaitingFio(history) &&
+      inNewBookingFlow(history) &&
+      !looksLikeRescheduleRequest(text) &&
+      !looksLikeAppointmentLookup(text) &&
+      !resolveProcedureIntent(text, history)
+    ) {
+      const reply = formatProcedureQuestion();
+      if (history.length === 0) {
+        history = [{ role: "system", content: systemPrompt() }];
+      }
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+      await saveConversation(phone, history);
+      return finalize(reply);
+    }
+
+    const procedureIntent = resolveProcedureIntent(text, history);
+    if (
+      doctorChosen &&
+      procedureIntent &&
+      !looksLikeDateOnly(text) &&
+      !historyAwaitingFio(history) &&
+      !lastFindSlotsPayload(history)
+    ) {
+      const reply =
+        "Отлично! Когда вам было бы удобно прийти? Можно назвать день недели или дату.";
+      if (history.length === 0) {
+        history = [{ role: "system", content: systemPrompt() }];
+      }
+      history.push({ role: "user", content: text });
+      history.push({ role: "assistant", content: reply });
+      await saveConversation(phone, history);
+      return finalize(reply);
+    }
+
     if (doctorChosen && looksLikeDateOnly(text)) {
       const doctorId = resolveDoctorId(text, history, doctors);
       const date = parseRequestedDate(text);
+      const resolvedProcedure = resolveProcedureIntent(text, history);
       if (doctorId && date) {
+        if (!resolvedProcedure) {
+          const reply = formatProcedureQuestion();
+          if (history.length === 0) {
+            history = [{ role: "system", content: systemPrompt() }];
+          }
+          history.push({ role: "user", content: text });
+          history.push({ role: "assistant", content: reply });
+          await saveConversation(phone, history);
+          return finalize(reply);
+        }
         if (!isDateBookable(date)) {
           const reply = `К сожалению, на сегодня уже нельзя записаться — ближайшая дата ${earliestBookableDateIso()}. Какой день вам удобнее?`;
           if (history.length === 0) {
@@ -946,12 +1176,17 @@ export class DialogOrchestrator {
           return finalize(reply);
         }
         try {
-          const result = await this.booking.findSlots({ doctorId, date });
+          const result = await this.booking.findSlots({
+            doctorId,
+            date,
+            procedureType: resolvedProcedure.procedureType,
+            visitReason: resolvedProcedure.visitReason,
+          });
           const preferred = parsePreferredTime(text);
           const timePref = parseTimeOfDayPreference(text);
           let reply: string;
           if (!result.slots.length) {
-            reply = `К сожалению, на этот день у врача нет свободных окон. Подобрать другой день?`;
+            reply = `К сожалению, на этот день нет свободных окон. Подобрать другой день?`;
           } else if (timePref) {
             reply =
               replyForTimePreference(timePref, result.slots) ??
@@ -974,7 +1209,7 @@ export class DialogOrchestrator {
             history,
             text,
             "find_slots",
-            { doctor_id: doctorId, date },
+            { doctor_id: doctorId, date, procedure_type: resolvedProcedure.procedureType, visit_reason: resolvedProcedure.visitReason },
             toolPayload,
             reply
           );
@@ -1075,11 +1310,79 @@ export class DialogOrchestrator {
         }
       }
 
-      const fio = extractPatientFioFromHistory(history, doctors);
+      const fio =
+        extractPatientFioFromHistory(history, doctors) ??
+        knownPatient?.patient_name ??
+        null;
       const doctorId = resolveDoctorId(text, history, doctors);
       const doc = doctors.find((d) => d.id === doctorId);
-      if (fio && doc && slotOk) {
-        const reply = `Отлично! Подтвердите, пожалуйста: ${fio}, врач ${doctorDisplayName(doc.full_name)}, ${prevSlots.date} в ${offeredSlot}. Всё верно?`;
+      const procedureLabel =
+        prevSlots?.visit_reason ??
+        prevSlots?.procedure_label ??
+        (prevSlots?.procedure_type
+          ? PROCEDURES.find((p) => p.id === prevSlots.procedure_type)?.label
+          : null);
+      if (fio && doc && slotOk && !historyAwaitingFinalConfirmation(history)) {
+        const procedurePart = procedureLabel ? `, ${procedureLabel}` : "";
+        const reply = `Отлично! Подтвердите, пожалуйста: ${fio}${procedurePart}, врач ${doctorDisplayName(doc.full_name)}, ${prevSlots.date} в ${offeredSlot}. Всё верно?`;
+        if (history.length === 0) {
+          history = [{ role: "system", content: systemPrompt() }];
+        }
+        history.push({ role: "user", content: text });
+        history.push({ role: "assistant", content: reply });
+        await saveConversation(phone, history);
+        return finalize(reply);
+      }
+
+      if (
+        fio &&
+        doc &&
+        doctorId &&
+        slotOk &&
+        historyAwaitingFinalConfirmation(history) &&
+        prevSlots?.procedure_type
+      ) {
+        try {
+          const appt = await this.booking.bookAppointment({
+            patientName: fio,
+            phone,
+            doctorId,
+            procedureType: prevSlots.procedure_type,
+            visitReason: prevSlots.visit_reason ?? procedureLabel ?? undefined,
+            date: prevSlots.date!,
+            time: offeredSlot,
+            comment: prevSlots.visit_reason ?? procedureLabel ?? undefined,
+          });
+          const reply = formatBookingConfirmation({
+            doctorName: appt.doctor_name ?? "врачу",
+            date: prevSlots.date!,
+            time: offeredSlot,
+          });
+          if (history.length === 0) {
+            history = [{ role: "system", content: systemPrompt() }];
+          }
+          history.push({ role: "user", content: text });
+          history.push({ role: "assistant", content: reply });
+          await saveConversation(phone, history);
+          return finalize(reply);
+        } catch (err) {
+          const reply =
+            err instanceof BookingError
+              ? err.message
+              : "Не удалось создать запись. Попробуйте ещё раз.";
+          if (history.length === 0) {
+            history = [{ role: "system", content: systemPrompt() }];
+          }
+          history.push({ role: "user", content: text });
+          history.push({ role: "assistant", content: reply });
+          await saveConversation(phone, history);
+          return finalize(reply);
+        }
+      }
+
+      if (!fio && doc && slotOk) {
+        const reply =
+          "Отлично! Подскажите, пожалуйста, ваше полное имя — фамилию, имя и отчество.";
         if (history.length === 0) {
           history = [{ role: "system", content: systemPrompt() }];
         }
@@ -1124,8 +1427,16 @@ export class DialogOrchestrator {
     }
 
     const prompt = greetedToday
-      ? `${systemPrompt()}\n\nСегодня ты УЖЕ поздоровался с пациентом. Не повторяй приветствие и шапку клиники.`
-      : systemPrompt();
+      ? `${systemPrompt()}\n\nСегодня ты УЖЕ поздоровался с пациентом. Не повторяй приветствие и шапку клиники.${
+          knownPatient
+            ? `\n\nПациент уже в системе: ${knownPatient.patient_name}. Не спрашивай ФИО повторно — используй это имя в book_appointment.`
+            : ""
+        }`
+      : `${systemPrompt()}${
+          knownPatient
+            ? `\n\nПациент уже в системе: ${knownPatient.patient_name}. Не спрашивай ФИО повторно — используй это имя в book_appointment.`
+            : ""
+        }`;
 
     if (history.length === 0) {
       history.push({ role: "system", content: prompt });
@@ -1260,9 +1571,21 @@ export class DialogOrchestrator {
               id: d.id,
               full_name: d.full_name,
               name: doctorDisplayName(d.full_name),
+              name_dative: doctorNameInDative(d.full_name),
               specialization: d.specialization,
             }))
           );
+        }
+        case "list_procedures": {
+          return JSON.stringify({
+            note: "Только для сопоставления ответа клиента. Не перечисляй пациенту — спроси «на какую процедуру хотите записаться?»",
+            procedures: listProcedures().map((p) => ({
+              id: p.id,
+              label: p.label,
+              duration_minutes: p.durationMinutes,
+              latest_end_time: p.latestEndTime ?? null,
+            })),
+          });
         }
         case "find_slots": {
           const date = String(args.date);
@@ -1273,10 +1596,31 @@ export class DialogOrchestrator {
               earliest_bookable_date: earliest,
             });
           }
+          const procedureType = String(
+            args.procedure_type ?? args.procedureType ?? ""
+          );
+          let visitReason = String(
+            args.visit_reason ?? args.visitReason ?? args.comment ?? ""
+          ).trim();
+          if (!visitReason && userText) {
+            visitReason =
+              resolveProcedureFromClientText(userText)?.visitReason ?? "";
+          }
+          if (!procedureType) {
+            return JSON.stringify({
+              error: "Сначала узнай у клиента, на какую процедуру он хочет записаться.",
+            });
+          }
+          if (!visitReason) {
+            const proc = PROCEDURES.find((p) => p.id === procedureType);
+            visitReason = proc?.label ?? procedureType;
+          }
           const result = await this.booking.findSlots({
             doctorId: Number(args.doctor_id),
             serviceId:
               args.service_id != null ? Number(args.service_id) : undefined,
+            procedureType,
+            visitReason,
             date: String(args.date),
           });
           const preferred = parsePreferredTime(userText);
@@ -1318,14 +1662,26 @@ export class DialogOrchestrator {
           );
         }
         case "book_appointment": {
+          const procedureType = String(
+            args.procedure_type ?? args.procedureType ?? ""
+          );
+          const visitReason = String(
+            args.visit_reason ??
+              args.visitReason ??
+              args.comment ??
+              ""
+          ).trim();
           const appt = await this.booking.bookAppointment({
             patientName: String(args.patient_name),
             phone,
             doctorId: Number(args.doctor_id),
-            serviceId: Number(args.service_id),
+            serviceId:
+              args.service_id != null ? Number(args.service_id) : undefined,
+            procedureType: procedureType || undefined,
+            visitReason: visitReason || undefined,
             date: String(args.date),
             time: String(args.time),
-            comment: args.comment ? String(args.comment) : undefined,
+            comment: visitReason || (args.comment ? String(args.comment) : undefined),
           });
           const confirmation_message = formatBookingConfirmation({
             doctorName: appt.doctor_name ?? "врачу",

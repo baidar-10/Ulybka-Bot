@@ -1,6 +1,7 @@
 import type { PoolClient } from "pg";
 import { CLINIC } from "../config/hours.js";
 import { pool, withTransaction } from "../db/pool.js";
+import { getKnownPatient, upsertKnownPatient } from "../db/patients.js";
 import type {
   Appointment,
   ClinicHour,
@@ -17,11 +18,19 @@ import type { MacdentSchedule } from "../macdent/schedule.js";
 import { MacdentError } from "../macdent/client.js";
 import { formatPatientFio } from "../macdent/parse.js";
 import {
+  applyProcedureSlotPolicy,
   applySameDaySlotPolicy,
   earliestBookableDateIso,
   isDateBookable,
+  isProcedureSlotAllowed,
   isSlotTimeAllowed,
 } from "./policy.js";
+import { normalizePhone } from "./phone.js";
+import {
+  getProcedure,
+  servicePatternsForProcedure,
+  type ProcedureType,
+} from "./procedures.js";
 
 export class BookingError extends Error {
   constructor(message: string) {
@@ -115,6 +124,48 @@ export class BookingService {
     throw new BookingError("У этого врача нет услуг в каталоге");
   }
 
+  private async resolveServiceForProcedure(
+    doctorId: number,
+    procedure: ProcedureType
+  ): Promise<Service> {
+    const patterns = servicePatternsForProcedure(procedure);
+    const list = await this.listServices(doctorId);
+    for (const pattern of patterns) {
+      const match = list.find((s) => pattern.test(s.name));
+      if (match) return match;
+    }
+    return this.resolveService(doctorId);
+  }
+
+  private async resolveBookingContext(params: {
+    doctorId: number;
+    serviceId?: number;
+    procedureType?: string;
+    visitReason?: string;
+  }): Promise<{
+    service: Service;
+    durationMinutes: number;
+    procedure: ProcedureType | null;
+    reasonForVisit: string;
+  }> {
+    const procedure = params.procedureType
+      ? getProcedure(params.procedureType)
+      : null;
+    if (params.procedureType && !procedure) {
+      throw new BookingError("Неизвестный тип процедуры");
+    }
+
+    const service = procedure
+      ? await this.resolveServiceForProcedure(params.doctorId, procedure)
+      : await this.resolveService(params.doctorId, params.serviceId);
+
+    const durationMinutes = procedure?.durationMinutes ?? service.duration_minutes;
+    const reasonForVisit =
+      params.visitReason?.trim() || procedure?.label || service.name;
+
+    return { service, durationMinutes, procedure, reasonForVisit };
+  }
+
   private async getHoursForDate(dateStr: string): Promise<ClinicHour | undefined> {
     const probe = new Date(`${dateStr}T12:00:00Z`);
     const map: Record<string, number> = {
@@ -144,10 +195,15 @@ export class BookingService {
     doctorId: number;
     date: string;
     serviceId?: number;
+    procedureType?: string;
+    visitReason?: string;
   }): Promise<{
     date: string;
     doctor: string;
     service: string;
+    procedure_type: string | null;
+    procedure_label: string | null;
+    visit_reason: string | null;
     duration_minutes: number;
     slots: string[];
     timezone: string;
@@ -161,7 +217,13 @@ export class BookingService {
         `Запись возможна начиная с ${earliestBookableDateIso()}`
       );
     }
-    const service = await this.resolveService(params.doctorId, params.serviceId);
+    const ctx = await this.resolveBookingContext({
+      doctorId: params.doctorId,
+      serviceId: params.serviceId,
+      procedureType: params.procedureType,
+      visitReason: params.visitReason,
+    });
+    const { service, durationMinutes, procedure, reasonForVisit } = ctx;
 
     const hours = await this.getHoursForDate(params.date);
     const dayStart = slotToRange({
@@ -177,20 +239,20 @@ export class BookingService {
       const day = await this.macdent.getDayAvailability(
         macdentDoctorId,
         params.date,
-        service.duration_minutes,
+        durationMinutes,
         hours
           ? { open_time: String(hours.open_time).slice(0, 5), close_time: String(hours.close_time).slice(0, 5) }
           : null
       );
       console.log(
-        `MacDent day slots doctor=${macdentDoctorId} date=${params.date} slots=${day.slots.join(",") || "(empty)"}`
+        `MacDent day slots doctor=${macdentDoctorId} date=${params.date} duration=${durationMinutes} slots=${day.slots.join(",") || "(empty)"}`
       );
       slots = day.slots.filter((t) => {
         try {
           const { startsAt } = slotToRange({
             dateStr: params.date,
             timeStr: t,
-            durationMinutes: service.duration_minutes,
+            durationMinutes,
             timeZone: CLINIC.timezone,
           });
           return startsAt > new Date();
@@ -210,7 +272,7 @@ export class BookingService {
 
       slots = generateSlots({
         dateStr: params.date,
-        durationMinutes: service.duration_minutes,
+        durationMinutes,
         hours,
         busy: rows.map((r) => ({
           starts_at: new Date(r.starts_at),
@@ -221,12 +283,20 @@ export class BookingService {
     }
 
     slots = applySameDaySlotPolicy(slots, params.date);
+    slots = applyProcedureSlotPolicy(
+      slots,
+      durationMinutes,
+      procedure?.latestEndTime
+    );
 
     return {
       date: params.date,
       doctor: doctor.full_name,
-      service: service.name,
-      duration_minutes: service.duration_minutes,
+      service: reasonForVisit,
+      procedure_type: procedure?.id ?? null,
+      procedure_label: procedure?.label ?? null,
+      visit_reason: reasonForVisit,
+      duration_minutes: durationMinutes,
       slots,
       timezone: CLINIC.timezone,
     };
@@ -236,14 +306,23 @@ export class BookingService {
     patientName: string;
     phone: string;
     doctorId: number;
-    serviceId: number;
+    serviceId?: number;
+    procedureType?: string;
+    visitReason?: string;
     date: string;
     time: string;
     comment?: string;
   }): Promise<Appointment> {
     const doctor = await this.getDoctor(params.doctorId);
     if (!doctor?.active) throw new BookingError("Врач не найден");
-    const service = await this.resolveService(params.doctorId, params.serviceId);
+    const ctx = await this.resolveBookingContext({
+      doctorId: params.doctorId,
+      serviceId: params.serviceId,
+      procedureType: params.procedureType,
+      visitReason: params.visitReason ?? params.comment,
+    });
+    const { service, durationMinutes, procedure, reasonForVisit } = ctx;
+    const visitReason = params.comment?.trim() || reasonForVisit;
 
     if (!this.macdent?.enabled) {
       const hours = await this.getHoursForDate(params.date);
@@ -265,7 +344,7 @@ export class BookingService {
     const { startsAt, endsAt } = slotToRange({
       dateStr: params.date,
       timeStr: params.time,
-      durationMinutes: service.duration_minutes,
+      durationMinutes,
       timeZone: CLINIC.timezone,
     });
 
@@ -273,7 +352,23 @@ export class BookingService {
       throw new BookingError("Нельзя записаться на прошедшее время");
     }
 
-    const patientFio = formatPatientFio(params.patientName);
+    if (
+      !isProcedureSlotAllowed(
+        params.time,
+        durationMinutes,
+        procedure?.latestEndTime
+      )
+    ) {
+      throw new BookingError(
+        `На ${params.time} записаться нельзя. Выберите другое время.`
+      );
+    }
+
+    const patientFio = formatPatientFio(
+      params.patientName ||
+        (await getKnownPatient(params.phone))?.patient_name ||
+        ""
+    );
     if (patientFio.split(" ").length < 3) {
       throw new BookingError(
         "Подскажите, пожалуйста, полное имя — фамилию, имя и отчество — чтобы оформить запись"
@@ -284,36 +379,41 @@ export class BookingService {
     const availability = await this.findSlots({
       doctorId: params.doctorId,
       date: params.date,
-      serviceId: params.serviceId,
+      serviceId: service.id,
+      procedureType: params.procedureType,
+      visitReason: visitReason,
     });
     if (!availability.slots.includes(params.time)) {
       throw new BookingError(
-        `Время ${params.time} недоступно. Свободно: ${availability.slots.join(", ") || "нет слотов"}`
+        `Время ${params.time} недоступно для «${visitReason}». Свободно: ${availability.slots.join(", ") || "нет слотов"}`
       );
     }
 
     try {
       let macdentZapisId: string | null = null;
+      let macdentPatientId: string | null = null;
       if (this.macdent?.enabled) {
         try {
           const macdentDoctorId = await this.resolveMacdentDoctorId(doctor);
-          const patientId = await this.macdent.ensurePatient(
+          const known = await getKnownPatient(params.phone);
+          macdentPatientId = await this.macdent.ensurePatient(
             patientFio,
-            normalizePhone(params.phone)
+            normalizePhone(params.phone),
+            known?.macdent_patient_id
           );
           const day = await this.macdent.getDayAvailability(
             macdentDoctorId,
             params.date,
-            service.duration_minutes
+            durationMinutes
           );
           macdentZapisId = await this.macdent.addZapis({
             doctorId: macdentDoctorId,
-            patientId,
+            patientId: macdentPatientId,
             date: params.date,
             time: params.time,
-            durationMinutes: service.duration_minutes,
+            durationMinutes,
             raspId: day.raspId,
-            comment: params.comment?.trim() || service.name,
+            comment: visitReason,
           });
         } catch (err) {
           const message =
@@ -332,14 +432,20 @@ export class BookingService {
             patientFio,
             normalizePhone(params.phone),
             params.doctorId,
-            params.serviceId,
+            service.id,
             startsAt,
             endsAt,
-            params.comment?.trim() || null,
+            visitReason,
             macdentZapisId,
           ]
         );
         return mapAppointment(rows[0]);
+      });
+
+      await upsertKnownPatient({
+        phone: params.phone,
+        patientName: patientFio,
+        macdentPatientId: macdentPatientId,
       });
 
       return this.enrich(appointment);
@@ -637,13 +743,7 @@ export class BookingService {
   }
 }
 
-export function normalizePhone(phone: string): string {
-  const digits = phone.replace(/\D/g, "");
-  if (digits.startsWith("8") && digits.length === 11) {
-    return `7${digits.slice(1)}`;
-  }
-  return digits;
-}
+export { normalizePhone } from "./phone.js";
 
 function isExclusionViolation(err: unknown): boolean {
   return (

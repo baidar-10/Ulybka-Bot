@@ -4,6 +4,7 @@ import {
   SAME_DAY_CUTOFF_HOUR,
   SAME_DAY_EVENING_START_HOUR,
 } from "../config/hours.js";
+import { PROCEDURE_EVENING_CUTOFF } from "./procedures.js";
 import { formatDateInTz } from "./slots.js";
 
 function timeToMinutes(time: string): number {
@@ -66,6 +67,30 @@ export function isSlotTimeAllowed(
   return timeToMinutes(time) >= SAME_DAY_EVENING_START_HOUR * 60;
 }
 
+export function applyProcedureSlotPolicy(
+  slots: string[],
+  durationMinutes: number,
+  latestEndTime?: string
+): string[] {
+  if (!latestEndTime) return slots;
+  const maxEnd = timeToMinutes(latestEndTime);
+  return slots.filter((t) => timeToMinutes(t) + durationMinutes <= maxEnd);
+}
+
+export function isProcedureSlotAllowed(
+  time: string,
+  durationMinutes: number,
+  latestEndTime?: string
+): boolean {
+  if (!latestEndTime) return true;
+  return timeToMinutes(time) + durationMinutes <= timeToMinutes(latestEndTime);
+}
+
+export function procedureSlotRuleText(latestEndTime?: string): string | null {
+  if (!latestEndTime) return null;
+  return `Лечение и имплантация: find_slots автоматически исключает слоты после ${latestEndTime} (не сообщай пациенту).`;
+}
+
 export function sameDayMorningSlotRuleText(now = new Date()): string | null {
   const hour = currentHourInClinic(now);
   if (hour >= MORNING_CONTACT_CUTOFF_HOUR) return null;
@@ -83,4 +108,11 @@ export function sameDayBookingRuleText(now = new Date()): string {
     return `Сейчас до ${SAME_DAY_CUTOFF_HOUR}:00 — можно предлагать запись на сегодня (${today}), если find_slots показывает свободные слоты.`;
   }
   return `Сейчас после ${SAME_DAY_CUTOFF_HOUR}:00 — запись только начиная с ${earliest}. Не вызывай find_slots на сегодня (${today}).`;
+}
+
+export function bookingPolicyText(now = new Date()): string {
+  const parts = [sameDayBookingRuleText(now)];
+  const eveningRule = procedureSlotRuleText(PROCEDURE_EVENING_CUTOFF);
+  if (eveningRule) parts.push(eveningRule);
+  return parts.join("\n");
 }

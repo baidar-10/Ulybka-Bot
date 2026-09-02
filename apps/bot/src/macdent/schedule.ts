@@ -265,6 +265,30 @@ export class MacdentSchedule {
     };
   }
 
+  async findPatientByPhone(phone: string): Promise<string | null> {
+    const seen = new Set<string>();
+    for (const params of [{ phone, tel: phone }]) {
+      try {
+        const data = await this.api.call("patient.find", params);
+        for (const row of asArray(data)) {
+          if (!row || typeof row !== "object") continue;
+          const rec = row as Record<string, unknown>;
+          const id = extractId(rec);
+          const rowPhone = pickString(rec, ["phone", "tel", "mobile", "number"]);
+          if (!id || seen.has(id)) continue;
+          seen.add(id);
+          if (rowPhone && phonesMatch(phone, rowPhone)) {
+            console.log(`MacDent patient found by phone id=${id}`);
+            return id;
+          }
+        }
+      } catch (err) {
+        console.error("MacDent patient.find by phone failed", err);
+      }
+    }
+    return null;
+  }
+
   async findMatchingPatient(name: string, phone: string): Promise<string | null> {
     const fio = formatPatientFio(name);
     const seen = new Set<string>();
@@ -312,7 +336,20 @@ export class MacdentSchedule {
     return id;
   }
 
-  async ensurePatient(name: string, phone: string): Promise<string> {
+  async ensurePatient(
+    name: string,
+    phone: string,
+    cachedMacdentId?: string | null
+  ): Promise<string> {
+    if (cachedMacdentId) {
+      console.log(`MacDent patient reused from cache id=${cachedMacdentId}`);
+      return cachedMacdentId;
+    }
+    const byPhone = await this.findPatientByPhone(phone);
+    if (byPhone) {
+      console.log(`MacDent patient reused by phone id=${byPhone}`);
+      return byPhone;
+    }
     const existing = await this.findMatchingPatient(name, phone);
     if (existing) {
       console.log(`MacDent patient reused id=${existing}`);

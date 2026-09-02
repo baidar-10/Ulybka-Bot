@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { applyProcedureSlotPolicy } from "../apps/bot/src/booking/policy.js";
 import {
   generateSlots,
   slotToRange,
@@ -59,6 +60,16 @@ const timeZone = "Asia/Almaty";
   assert.ok(!slots.includes("11:00"));
   assert.ok(!slots.includes("11:30"));
   assert.ok(slots.includes("12:00"));
+}
+
+// Лечение 90 мин — последний старт 17:30 (конец 19:00)
+{
+  const slots = applyProcedureSlotPolicy(
+    ["16:00", "17:00", "17:30", "18:00", "18:30"],
+    90,
+    "19:00"
+  );
+  assert.deepEqual(slots, ["16:00", "17:00", "17:30"]);
 }
 
 console.log("slot tests passed");

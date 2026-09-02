@@ -1,6 +1,6 @@
 import { CLINIC } from "../config/hours.js";
 import { formatDateInTz, formatTimeInTz } from "../booking/slots.js";
-import { doctorDisplayName, normalizeName } from "../macdent/parse.js";
+import { doctorNameInDative } from "./doctor-names.js";
 
 const MONTHS_GENITIVE = [
   "января",
@@ -16,17 +16,6 @@ const MONTHS_GENITIVE = [
   "ноября",
   "декабря",
 ] as const;
-
-const DOCTOR_DATIVE: Record<string, string> = {
-  "абдикаримова асель": "Абдикаримовой Асель",
-  "абдикаримов ержан": "Абдикаримову Ержану",
-  "масенов ансар": "Масенову Ансару",
-};
-
-export function doctorNameInDative(fullName: string): string {
-  const key = normalizeName(doctorDisplayName(fullName));
-  return DOCTOR_DATIVE[key] ?? doctorDisplayName(fullName);
-}
 
 export function formatDateHumanRu(isoDate: string): string {
   const [, month, day] = isoDate.split("-").map(Number);
@@ -105,8 +94,8 @@ export function formatAppointmentLookupReply(
   const lines = appointments.map((a) => {
     const date = formatDateInTz(a.starts_at, CLINIC.timezone);
     const time = formatTimeInTz(a.starts_at, CLINIC.timezone);
-    const doctor = doctorDisplayName(a.doctor_name ?? "врач");
-    return `• ${formatDateHumanRu(date)} в ${time} — ${doctor}`;
+    const doctor = doctorNameInDative(a.doctor_name ?? "врачу");
+    return `• ${formatDateHumanRu(date)} в ${time} — к ${doctor}`;
   });
   return `Вот ваши предстоящие записи 😊
 
