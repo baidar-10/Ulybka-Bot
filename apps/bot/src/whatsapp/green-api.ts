@@ -1,12 +1,25 @@
 import { env } from "../config/env.js";
 import type { DialogOrchestrator } from "../ai/orchestrator.js";
-import { normalizePhone } from "../booking/service.js";
+import { normalizePhone } from "../booking/phone.js";
 import type { WhatsAppProvider } from "./provider.js";
 
 export type { WhatsAppProvider } from "./provider.js";
 
-/** Ignore queued/old messages older than this (ms) */
-const MAX_MESSAGE_AGE_MS = 2 * 60 * 1000;
+/** Only handle journal messages newer than this (ms) after startup priming */
+const JOURNAL_MAX_AGE_MS = 10 * 60 * 1000;
+const JOURNAL_POLL_MS = 3000;
+
+interface JournalMessage {
+  type?: string;
+  idMessage?: string;
+  timestamp?: number;
+  typeMessage?: string;
+  chatId?: string;
+  textMessage?: string;
+  extendedTextMessage?: string;
+  senderId?: string;
+  senderName?: string;
+}
 
 interface GreenNotification {
   receiptId: number;
@@ -46,6 +59,14 @@ export function createGreenApiProvider(
   const processing = new Set<string>();
   const processedIds = new Set<string>();
 
+  function rememberId(id: string): void {
+    processedIds.add(id);
+    if (processedIds.size > 3000) {
+      const first = processedIds.values().next().value;
+      if (first) processedIds.delete(first);
+    }
+  }
+
   async function sendText(phone: string, text: string): Promise<void> {
     const chatId = `${normalizePhone(phone)}@c.us`;
     const url = `${instanceBase()}/sendMessage/${token()}`;
@@ -71,45 +92,82 @@ export function createGreenApiProvider(
   }
 
   async function receiveOnce(timeoutSec = 5): Promise<GreenNotification | null> {
-    // Green API requires receiveTimeout between 5 and 60 seconds
     const wait = Math.min(60, Math.max(5, timeoutSec));
     const url = `${instanceBase()}/receiveNotification/${token()}?receiveTimeout=${wait}`;
     const res = await fetch(url);
     const raw = (await res.text()).trim();
     if (res.status !== 200) {
-      console.error(
-        `GREEN-API receiveNotification HTTP ${res.status}: ${raw.slice(0, 300) || "(empty)"}`
-      );
-      if (/webhook url is set/i.test(raw)) {
+      if (res.status !== 400 || !/webhook url is set/i.test(raw)) {
         console.error(
-          "GREEN-API: очистите webhookUrl в кабинете (или подождите ~1 мин после setSettings) — иначе очередь HTTP API не работает."
+          `GREEN-API receiveNotification HTTP ${res.status}: ${raw.slice(0, 200) || "(empty)"}`
         );
       }
       return null;
     }
-    // Empty body / "null" = no notifications in queue
     if (!raw || raw === "null") return null;
-    let data: GreenNotification | null;
     try {
-      data = JSON.parse(raw) as GreenNotification | null;
+      const data = JSON.parse(raw) as GreenNotification | null;
+      if (!data || data.receiptId == null) return null;
+      return data;
     } catch {
-      console.warn(`GREEN-API receiveNotification: invalid JSON (${raw.slice(0, 80)})`);
       return null;
     }
-    if (!data || data.receiptId == null) return null;
-    return data;
   }
 
-  /** Clear backlog so bot does not reply to old queued chats on startup */
   async function flushQueue(): Promise<number> {
     let cleared = 0;
-    for (let i = 0; i < 200; i++) {
+    for (let i = 0; i < 50; i++) {
       const n = await receiveOnce(5);
       if (!n) break;
+      if (n.body.idMessage) rememberId(n.body.idMessage);
       await deleteNotification(n.receiptId);
       cleared += 1;
     }
     return cleared;
+  }
+
+  async function fetchJournal(minutes = 30): Promise<JournalMessage[]> {
+    const url = `${instanceBase()}/lastIncomingMessages/${token()}?minutes=${minutes}`;
+    const res = await fetch(url);
+    const raw = await res.text();
+    if (!res.ok) {
+      console.warn(`GREEN-API lastIncomingMessages HTTP ${res.status}: ${raw.slice(0, 200)}`);
+      return [];
+    }
+    try {
+      const data = JSON.parse(raw || "[]") as unknown;
+      return Array.isArray(data) ? (data as JournalMessage[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Mark existing journal messages as seen so we only reply to new ones. */
+  async function primeJournal(): Promise<number> {
+    const list = await fetchJournal(60);
+    let marked = 0;
+    for (const m of list) {
+      if (m.idMessage) {
+        rememberId(m.idMessage);
+        marked += 1;
+      }
+    }
+    const privateTexts = list.filter(
+      (m) =>
+        m.typeMessage === "textMessage" &&
+        m.chatId &&
+        !m.chatId.endsWith("@g.us") &&
+        (m.textMessage || "").trim()
+    );
+    console.log(
+      `GREEN-API journal prime: ${marked} ids marked, ${privateTexts.length} private texts in last 60m (will not auto-reply to these)`
+    );
+    for (const m of privateTexts.slice(0, 3)) {
+      console.log(
+        `  · seen ${m.chatId}: ${(m.textMessage || "").slice(0, 50)}`
+      );
+    }
+    return marked;
   }
 
   async function ensureHttpApiMode(): Promise<void> {
@@ -133,7 +191,7 @@ export function createGreenApiProvider(
       const body = await res.text();
       console.warn(`GREEN-API setSettings warning: ${res.status} ${body}`);
     } else {
-      console.log("GREEN-API: webhookUrl cleared, incoming via receiveNotification");
+      console.log("GREEN-API: webhookUrl cleared; listening via journal + receiveNotification");
     }
 
     try {
@@ -146,11 +204,6 @@ export function createGreenApiProvider(
         console.log(
           `GREEN-API settings: webhookUrl="${settings.webhookUrl || ""}" incomingWebhook=${settings.incomingWebhook || "?"}`
         );
-        if (settings.webhookUrl) {
-          console.error(
-            `GREEN-API: webhookUrl всё ещё задан (${settings.webhookUrl}) — receiveNotification не будет работать, пока URL не очистите в кабинете.`
-          );
-        }
       }
     } catch (err) {
       console.warn("GREEN-API getSettings failed", err);
@@ -168,97 +221,20 @@ export function createGreenApiProvider(
     return data.stateInstance || "unknown";
   }
 
-  function extractText(n: GreenNotification): string | null {
-    const md = n.body.messageData;
-    if (!md) return null;
-    // Ignore non-chat noise
-    if (
-      md.typeMessage &&
-      ![
-        "textMessage",
-        "extendedTextMessage",
-        "quotedMessage",
-      ].includes(md.typeMessage)
-    ) {
-      return null;
-    }
-    if (md.typeMessage === "textMessage") {
-      return md.textMessageData?.textMessage?.trim() || null;
-    }
-    if (
-      md.typeMessage === "extendedTextMessage" ||
-      md.typeMessage === "quotedMessage"
-    ) {
-      return md.extendedTextMessageData?.text?.trim() || null;
-    }
-    return null;
-  }
-
-  function shouldSkip(n: GreenNotification): string | null {
-    const type = n.body.typeWebhook;
-    if (type !== "incomingMessageReceived") {
-      return `skip type=${type}`;
-    }
-
-    const chatId = n.body.senderData?.chatId || "";
-    if (chatId.endsWith("@g.us")) return "skip group";
-    if (chatId.includes("status@broadcast")) return "skip status";
-
-    const wid = n.body.instanceData?.wid || "";
-    const sender = n.body.senderData?.sender || "";
-    // Don't treat own account echoes as patient messages
-    if (wid && sender && wid === sender) return "skip self";
-
-    const idMessage = n.body.idMessage;
-    if (idMessage && processedIds.has(idMessage)) {
-      return `skip duplicate ${idMessage}`;
-    }
-
-    const ts = n.body.timestamp ? n.body.timestamp * 1000 : 0;
-    if (ts && Date.now() - ts > MAX_MESSAGE_AGE_MS) {
-      return `skip old message age=${Math.round((Date.now() - ts) / 1000)}s`;
-    }
-    // Also ignore anything that arrived before we finished startup flush
-    if (readyAt && ts && ts < readyAt - 5000) {
-      return "skip pre-start message";
-    }
-
-    return null;
-  }
-
-  async function handleNotification(n: GreenNotification): Promise<void> {
-    const skip = shouldSkip(n);
-    if (skip) {
-      console.log(`GREEN-API ${skip}`);
-      return;
-    }
-
-    const text = extractText(n);
-    if (!text) {
-      console.log(
-        `GREEN-API skip non-text type=${n.body.messageData?.typeMessage}`
-      );
-      return;
-    }
-
-    const raw =
-      n.body.senderData?.sender || n.body.senderData?.chatId || "";
-    const phone = normalizePhone(raw.split("@")[0] || "");
-    if (!phone) return;
-
-    const idMessage = n.body.idMessage || `${phone}:${n.receiptId}`;
-    const key = idMessage;
-    if (processing.has(key)) return;
-    processing.add(key);
-    processedIds.add(idMessage);
-    // keep set bounded
-    if (processedIds.size > 2000) {
-      const first = processedIds.values().next().value;
-      if (first) processedIds.delete(first);
-    }
+  async function handleIncoming(params: {
+    idMessage: string;
+    phone: string;
+    text: string;
+    source: string;
+  }): Promise<void> {
+    const { idMessage, phone, text, source } = params;
+    if (!phone || !text) return;
+    if (processedIds.has(idMessage) || processing.has(idMessage)) return;
+    processing.add(idMessage);
+    rememberId(idMessage);
 
     try {
-      console.log(`GREEN-API incoming from ${phone}: ${text.slice(0, 80)}`);
+      console.log(`GREEN-API incoming (${source}) from ${phone}: ${text.slice(0, 80)}`);
       const reply = await orchestrator.handleMessage({ phone, text });
       await sendText(phone, reply);
     } catch (err) {
@@ -272,20 +248,98 @@ export function createGreenApiProvider(
         /* ignore */
       }
     } finally {
-      processing.delete(key);
+      processing.delete(idMessage);
     }
   }
 
+  async function handleNotification(n: GreenNotification): Promise<void> {
+    if (n.body.typeWebhook !== "incomingMessageReceived") return;
+    const chatId = n.body.senderData?.chatId || "";
+    if (chatId.endsWith("@g.us") || chatId.includes("status@broadcast")) return;
+
+    const wid = n.body.instanceData?.wid || "";
+    const sender = n.body.senderData?.sender || "";
+    if (wid && sender && wid === sender) return;
+
+    const md = n.body.messageData;
+    let text: string | null = null;
+    if (md?.typeMessage === "textMessage") {
+      text = md.textMessageData?.textMessage?.trim() || null;
+    } else if (
+      md?.typeMessage === "extendedTextMessage" ||
+      md?.typeMessage === "quotedMessage"
+    ) {
+      text = md.extendedTextMessageData?.text?.trim() || null;
+    }
+    if (!text) return;
+
+    const raw = sender || chatId;
+    const phone = normalizePhone(raw.split("@")[0] || "");
+    const idMessage = n.body.idMessage || `${phone}:${n.receiptId}`;
+    await handleIncoming({ idMessage, phone, text, source: "queue" });
+  }
+
+  async function pollJournalOnce(): Promise<number> {
+    const list = await fetchJournal(15);
+    let handled = 0;
+    // Process oldest first
+    const ordered = [...list].reverse();
+    for (const m of ordered) {
+      if (!m.idMessage || processedIds.has(m.idMessage)) continue;
+      if (m.typeMessage !== "textMessage" && m.typeMessage !== "extendedTextMessage") {
+        rememberId(m.idMessage);
+        continue;
+      }
+      const chatId = m.chatId || m.senderId || "";
+      if (!chatId || chatId.endsWith("@g.us") || chatId.includes("status@broadcast")) {
+        rememberId(m.idMessage);
+        continue;
+      }
+      const text = (m.textMessage || m.extendedTextMessage || "").trim();
+      if (!text) {
+        rememberId(m.idMessage);
+        continue;
+      }
+      const ts = m.timestamp ? m.timestamp * 1000 : 0;
+      // After priming, ignore very old journal noise; allow recent messages
+      if (readyAt && ts && ts < readyAt - 15_000) {
+        rememberId(m.idMessage);
+        continue;
+      }
+      if (ts && Date.now() - ts > JOURNAL_MAX_AGE_MS) {
+        rememberId(m.idMessage);
+        continue;
+      }
+
+      const phone = normalizePhone((m.senderId || chatId).split("@")[0] || "");
+      await handleIncoming({
+        idMessage: m.idMessage,
+        phone,
+        text,
+        source: "journal",
+      });
+      handled += 1;
+    }
+    return handled;
+  }
+
   async function pollLoop(): Promise<void> {
+    console.log("GREEN-API: primary listen = lastIncomingMessages journal (queue often empty on this instance)");
     while (!stopping) {
       try {
-        const data = await receiveOnce(10);
-        if (data) {
+        // Drain notification queue if anything appears (bonus path)
+        const n = await receiveOnce(5);
+        if (n) {
           try {
-            await handleNotification(data);
+            await handleNotification(n);
           } finally {
-            await deleteNotification(data.receiptId);
+            await deleteNotification(n.receiptId);
           }
+        }
+
+        const handled = await pollJournalOnce();
+        if (!handled && !n) {
+          await sleep(JOURNAL_POLL_MS);
         }
       } catch (err) {
         if (!stopping) {
@@ -316,10 +370,10 @@ export function createGreenApiProvider(
       }
 
       const cleared = await flushQueue();
+      console.log(`GREEN-API: cleared ${cleared} queue notification(s)`);
+      await primeJournal();
       readyAt = Date.now();
-      console.log(
-        `GREEN-API: cleared ${cleared} old notification(s), now listening for new messages only`
-      );
+      console.log("GREEN-API: now listening for NEW messages only");
 
       loopPromise = pollLoop();
     },
