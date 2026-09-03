@@ -7,7 +7,8 @@ export type { WhatsAppProvider } from "./provider.js";
 
 /** Only handle journal messages newer than this (ms) after startup priming */
 const JOURNAL_MAX_AGE_MS = 10 * 60 * 1000;
-const JOURNAL_POLL_MS = 3000;
+const JOURNAL_POLL_MS = 8000;
+const JOURNAL_BACKOFF_MS = 30000;
 
 interface JournalMessage {
   type?: string;
@@ -130,6 +131,10 @@ export function createGreenApiProvider(
     const url = `${instanceBase()}/lastIncomingMessages/${token()}?minutes=${minutes}`;
     const res = await fetch(url);
     const raw = await res.text();
+    if (res.status === 429) {
+      console.warn("GREEN-API lastIncomingMessages 429 — пауза из‑за лимита");
+      throw Object.assign(new Error("rate_limited"), { code: 429 });
+    }
     if (!res.ok) {
       console.warn(`GREEN-API lastIncomingMessages HTTP ${res.status}: ${raw.slice(0, 200)}`);
       return [];
@@ -324,10 +329,26 @@ export function createGreenApiProvider(
   }
 
   async function pollLoop(): Promise<void> {
-    console.log("GREEN-API: primary listen = lastIncomingMessages journal (queue often empty on this instance)");
+    console.log(
+      "GREEN-API: primary listen = lastIncomingMessages journal (queue often empty on this instance)"
+    );
+    let journalBackoffUntil = 0;
     while (!stopping) {
       try {
-        // Drain notification queue if anything appears (bonus path)
+        // Prefer journal; touch queue only lightly (empty queue is normal here)
+        if (Date.now() >= journalBackoffUntil) {
+          try {
+            await pollJournalOnce();
+          } catch (err) {
+            if ((err as { code?: number })?.code === 429) {
+              journalBackoffUntil = Date.now() + JOURNAL_BACKOFF_MS;
+            } else {
+              throw err;
+            }
+          }
+        }
+
+        // Non-blocking-ish queue check with minimum timeout
         const n = await receiveOnce(5);
         if (n) {
           try {
@@ -335,16 +356,13 @@ export function createGreenApiProvider(
           } finally {
             await deleteNotification(n.receiptId);
           }
-        }
-
-        const handled = await pollJournalOnce();
-        if (!handled && !n) {
+        } else {
           await sleep(JOURNAL_POLL_MS);
         }
       } catch (err) {
         if (!stopping) {
           console.error("GREEN-API poll error", err);
-          await sleep(3000);
+          await sleep(5000);
         }
       }
     }

@@ -656,11 +656,28 @@ function historyAskedProcedure(history: ConversationMessage[]): boolean {
   );
 }
 
+function historyAwaitingProcedureAnswer(
+  history: ConversationMessage[]
+): boolean {
+  const last = [...history]
+    .reverse()
+    .find((m) => m.role === "assistant" && m.content);
+  if (!last?.content) return false;
+  return /на какую процедуру|какую процедуру/i.test(last.content);
+}
+
+function mentionsBookingDate(text: string): boolean {
+  return /\b(сегодня|завтра|послезавтра|понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|\d{1,2}[./]\d{1,2})\b/i.test(
+    text
+  );
+}
+
 function looksLikeProcedureAnswer(text: string): boolean {
   const t = text.trim();
   if (!t || t.length < 2) return false;
-  if (looksLikeDateOnly(text)) return false;
-  if (/^(да|нет|ок|1|2|3)$/i.test(t)) return false;
+  if (looksLikeDateOnly(text) || mentionsBookingDate(text)) return false;
+  if (/^(да|нет|ок|окей|ага|угу|хорошо|1|2|3)$/i.test(t)) return false;
+  if (/^(можно|хочу|давайте)\s+(завтра|сегодня|в\s+)/i.test(t)) return false;
   return true;
 }
 
@@ -668,7 +685,12 @@ function extractProcedureAnswerFromHistory(
   history: ConversationMessage[],
   currentText?: string
 ): string | null {
-  if (currentText && looksLikeProcedureAnswer(currentText)) {
+  // Only treat current message as procedure if we just asked for it
+  if (
+    currentText &&
+    historyAwaitingProcedureAnswer(history) &&
+    looksLikeProcedureAnswer(currentText)
+  ) {
     return currentText.trim();
   }
   if (!historyAskedProcedure(history)) return null;
@@ -800,19 +822,30 @@ function wantsNewBooking(text: string): boolean {
 function looksLikeDateOnly(text: string): boolean {
   const t = text.trim();
   if (
-    /^(на\s+)?(понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|сегодня|завтра)\b/i.test(
+    /^(на\s+)?(понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|сегодня|завтра|послезавтра)\b/i.test(
       t
     )
   ) {
     return true;
   }
-  if (/\bна\s+(сегодня|завтра)\b/i.test(t)) return true;
+  if (/\bна\s+(сегодня|завтра|послезавтра)\b/i.test(t)) return true;
   if (
-    /\b(сегодня|завтра)\b/i.test(t) &&
-    /^(можно|хочу|на|давайте|запиш|удобн|прийти|могу|есть)/i.test(t)
+    /\b(сегодня|завтра|послезавтра|понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень)\b/i.test(
+      t
+    ) &&
+    /^(можно|хочу|на|давайте|запиш|удобн|прийти|могу|есть|в)\b/i.test(t)
   ) {
     return true;
   }
+  // «можно в пятницу», «давайте в четверг»
+  if (
+    /^(можно|хочу|давайте|запишите)?\s*(в|на)?\s*(понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|сегодня|завтра)\b/i.test(
+      t
+    )
+  ) {
+    return true;
+  }
+  if (/^\d{1,2}[./]\d{1,2}([./]\d{2,4})?$/.test(t)) return true;
   return false;
 }
 
@@ -1136,6 +1169,7 @@ export class DialogOrchestrator {
       doctorChosen &&
       procedureIntent &&
       !looksLikeDateOnly(text) &&
+      !mentionsBookingDate(text) &&
       !historyAwaitingFio(history) &&
       !lastFindSlotsPayload(history)
     ) {
@@ -1150,7 +1184,7 @@ export class DialogOrchestrator {
       return finalize(reply);
     }
 
-    if (doctorChosen && looksLikeDateOnly(text)) {
+    if (doctorChosen && (looksLikeDateOnly(text) || mentionsBookingDate(text))) {
       const doctorId = resolveDoctorId(text, history, doctors);
       const date = parseRequestedDate(text);
       const resolvedProcedure = resolveProcedureIntent(text, history);
