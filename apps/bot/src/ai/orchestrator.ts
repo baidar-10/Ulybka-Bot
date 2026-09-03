@@ -257,7 +257,7 @@ consultation, treatment, cleaning, correction, crowns, crown_correction, extract
 === Порядок записи (строго, не прыгай через шаги) ===
 1) Пока врач не выбран — list_doctors и список врачей. Не спрашивай дату и процедуру. Не вызывай find_slots.
 2) Врач выбран — спроси ОТКРЫТЫМ вопросом: «На какую процедуру вы хотите записаться?» Без списка вариантов. Не вызывай find_slots.
-3) Клиент назвал процедуру — запомни его формулировку как visit_reason (причина обращения в MacDent). Сопоставь с procedure_type через list_procedures. Спроси дату.
+3) Клиент назвал процедуру — запомни формулировку как visit_reason. Если назвал ДО выбора врача — после выбора врача НЕ переспрашивай процедуру, сразу спроси дату.
 4) Дата есть — find_slots с procedure_type и visit_reason.
    Время подбирается автоматически: длительность процедуры + занятость врача из MacDent.
    Предлагай только то, что вернул find_slots (туда уже не попадают пересечения со следующей записью).
@@ -739,26 +739,55 @@ function extractProcedureAnswerFromHistory(
   ) {
     return currentText.trim();
   }
-  if (!historyAskedProcedure(history)) return null;
-  let askedIdx = -1;
-  for (let i = history.length - 1; i >= 0; i--) {
-    const m = history[i];
-    if (
-      m.role === "assistant" &&
-      m.content &&
-      /на какую процедуру|какую процедуру/i.test(m.content)
-    ) {
-      askedIdx = i;
-      break;
+
+  // Ответ сразу после вопроса про процедуру
+  if (historyAskedProcedure(history)) {
+    let askedIdx = -1;
+    for (let i = history.length - 1; i >= 0; i--) {
+      const m = history[i];
+      if (
+        m.role === "assistant" &&
+        m.content &&
+        /на какую процедуру|какую процедуру/i.test(m.content)
+      ) {
+        askedIdx = i;
+        break;
+      }
+    }
+    if (askedIdx >= 0) {
+      for (let i = askedIdx + 1; i < history.length; i++) {
+        const m = history[i];
+        if (
+          m.role === "user" &&
+          m.content &&
+          looksLikeProcedureAnswer(m.content) &&
+          textDescribesProcedure(m.content)
+        ) {
+          return m.content.trim();
+        }
+      }
     }
   }
-  if (askedIdx < 0) return null;
-  for (let i = askedIdx + 1; i < history.length; i++) {
+
+  // Клиент назвал услугу раньше (до выбора врача) — не переспрашиваем
+  for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i];
-    if (m.role === "user" && m.content && looksLikeProcedureAnswer(m.content)) {
+    if (m.role !== "user" || !m.content) continue;
+    if (looksLikeDateOnly(m.content) || mentionsBookingDate(m.content)) continue;
+    if (textDescribesProcedure(m.content)) {
       return m.content.trim();
     }
   }
+
+  if (
+    currentText &&
+    textDescribesProcedure(currentText) &&
+    !looksLikeDateOnly(currentText) &&
+    !mentionsBookingDate(currentText)
+  ) {
+    return currentText.trim();
+  }
+
   return null;
 }
 
@@ -768,7 +797,7 @@ function resolveProcedureIntent(
 ): { procedureType: string; visitReason: string } | null {
   const answer =
     extractProcedureAnswerFromHistory(history, text) ??
-    (looksLikeProcedureAnswer(text) ? text.trim() : null);
+    (textDescribesProcedure(text) ? text.trim() : null);
   if (!answer) {
     for (let i = history.length - 1; i >= 0; i--) {
       const m = history[i];
@@ -791,6 +820,8 @@ function resolveProcedureIntent(
     }
     return null;
   }
+  // Не считаем «ответом про процедуру» голое имя врача / «к Ержану»
+  if (!textDescribesProcedure(answer)) return null;
   const resolved = resolveProcedureFromClientText(answer);
   if (!resolved) return null;
   return {
@@ -975,8 +1006,13 @@ function resolveDoctorId(
   const numPick = [...history]
     .reverse()
     .find((m) => m.role === "user" && m.content && /^[123]$/.test(m.content.trim()));
-  if (numPick?.content && historyHasChosenDoctor(history, doctors)) {
-    const idx = Number(numPick.content.trim()) - 1;
+  const currentNum = /^[123]$/.test(text.trim()) ? text.trim() : null;
+  const pick = currentNum ?? numPick?.content?.trim();
+  if (
+    pick &&
+    (historyShowedDoctorList(history) || historyHasChosenDoctor(history, doctors))
+  ) {
+    const idx = Number(pick) - 1;
     if (doctors[idx]) return doctors[idx].id;
   }
 
@@ -1211,8 +1247,12 @@ export class DialogOrchestrator {
     }
 
     const doctors = await this.booking.listDoctors();
+    const pickingDoctorNow =
+      historyShowedDoctorList(history) && /^[123]$/.test(text.trim());
     const doctorChosen =
-      textMentionsDoctor(text, doctors) || historyHasChosenDoctor(history, doctors);
+      textMentionsDoctor(text, doctors) ||
+      historyHasChosenDoctor(history, doctors) ||
+      pickingDoctorNow;
     const mustPickDoctor =
       !doctorChosen &&
       !historyAwaitingFio(history) &&
@@ -1234,7 +1274,7 @@ export class DialogOrchestrator {
     const prevSlots = lastFindSlotsPayload(history);
 
     if (
-      textMentionsDoctor(text, doctors) &&
+      (textMentionsDoctor(text, doctors) || pickingDoctorNow) &&
       !looksLikeDateOnly(text) &&
       !historyAwaitingFio(history) &&
       (historyShowedDoctorList(history) || /передумал|другого врача/i.test(text))
@@ -1242,8 +1282,15 @@ export class DialogOrchestrator {
       const doctorId = resolveDoctorId(text, history, doctors);
       const doc = doctors.find((d) => d.id === doctorId);
       if (doc) {
-        if (textDescribesProcedure(text) && !looksLikeDateOnly(text)) {
-          const reply = "Отлично! Когда вам было бы удобно прийти?";
+        // Уже назвали услугу раньше («пломбу поставить») — не переспрашиваем
+        const knownProcedure = resolveProcedureIntent(text, [
+          ...history,
+          { role: "user", content: text },
+        ]);
+
+        if (knownProcedure) {
+          const reply =
+            "Отлично! Когда вам было бы удобно прийти? Можно назвать день недели или дату.";
           if (history.length === 0) {
             history = [{ role: "system", content: systemPrompt() }];
           }
