@@ -7,7 +7,6 @@ import {
   extractBusyDateWindows,
   extractId,
   extractRaspDayWindows,
-  extractScheduleWindows,
   formatPatientFio,
   namesMatch,
   patientNamesMatch,
@@ -55,6 +54,27 @@ function mergeTimeWindows(
     open_time: minutesToTime(w.start),
     close_time: minutesToTime(w.end),
   }));
+}
+
+function intersectTimeWindows(
+  a: { open_time: string; close_time: string }[],
+  b: { open_time: string; close_time: string }[]
+): { open_time: string; close_time: string }[] {
+  const out: { open_time: string; close_time: string }[] = [];
+  for (const left of a) {
+    const ls = timeToMinutesLocal(left.open_time);
+    const le = timeToMinutesLocal(left.close_time);
+    for (const right of b) {
+      const rs = timeToMinutesLocal(right.open_time);
+      const re = timeToMinutesLocal(right.close_time);
+      const start = Math.max(ls, rs);
+      const end = Math.min(le, re);
+      if (end > start) {
+        out.push({ open_time: minutesToTime(start), close_time: minutesToTime(end) });
+      }
+    }
+  }
+  return mergeTimeWindows(out);
 }
 
 export class MacdentSchedule {
@@ -112,55 +132,6 @@ export class MacdentSchedule {
     return [...slots].sort();
   }
 
-  /** Free gaps between busy appointments within clinic hours (MacDent get_free_time can be incomplete). */
-  private gapsFromBusyAndClinic(
-    isoDate: string,
-    clinicHours: { open_time: string; close_time: string },
-    busy: BusyInterval[]
-  ): { open_time: string; close_time: string }[] {
-    const tz = CLINIC.timezone;
-    const dayOpen = slotToRange({
-      dateStr: isoDate,
-      timeStr: clinicHours.open_time,
-      durationMinutes: 1,
-      timeZone: tz,
-    }).startsAt;
-    const dayClose = slotToRange({
-      dateStr: isoDate,
-      timeStr: clinicHours.close_time,
-      durationMinutes: 1,
-      timeZone: tz,
-    }).startsAt;
-
-    const relevant = busy
-      .filter((b) => b.ends_at > dayOpen && b.starts_at < dayClose)
-      .sort((a, b) => a.starts_at.getTime() - b.starts_at.getTime());
-
-    const gaps: { open_time: string; close_time: string }[] = [];
-    let cursor = dayOpen.getTime();
-
-    for (const block of relevant) {
-      const blockStart = Math.max(block.starts_at.getTime(), dayOpen.getTime());
-      const blockEnd = Math.min(block.ends_at.getTime(), dayClose.getTime());
-      if (blockStart > cursor) {
-        gaps.push({
-          open_time: formatTimeInTz(new Date(cursor), tz),
-          close_time: formatTimeInTz(new Date(blockStart), tz),
-        });
-      }
-      if (blockEnd > cursor) cursor = blockEnd;
-    }
-
-    if (cursor < dayClose.getTime()) {
-      gaps.push({
-        open_time: formatTimeInTz(new Date(cursor), tz),
-        close_time: clinicHours.close_time,
-      });
-    }
-
-    return gaps.filter((g) => timeToMinutesLocal(g.open_time) < timeToMinutesLocal(g.close_time));
-  }
-
   async getDayAvailability(
     doctorId: string,
     isoDate: string,
@@ -169,7 +140,7 @@ export class MacdentSchedule {
   ): Promise<{ slots: string[]; raspId: string | null }> {
     const [y, m] = isoDate.split("-");
     let raspId: string | null = null;
-    let windows: { open_time: string; close_time: string }[] = [];
+    let workWindows: { open_time: string; close_time: string }[] = [];
 
     try {
       const rasp = await this.api.call("rasp.find", {
@@ -187,9 +158,9 @@ export class MacdentSchedule {
         parsed = extractRaspDayWindows(raspPad, doctorId, isoDate);
       }
       raspId = parsed.raspId;
-      windows = parsed.windows;
+      workWindows = parsed.windows;
       console.log(
-        `MacDent rasp doctor=${doctorId} date=${isoDate} raspId=${raspId ?? "-"} windows=${windows.map((w) => `${w.open_time}-${w.close_time}`).join(",") || "(empty)"}`
+        `MacDent rasp doctor=${doctorId} date=${isoDate} raspId=${raspId ?? "-"} windows=${workWindows.map((w) => `${w.open_time}-${w.close_time}`).join(",") || "(empty)"}`
       );
     } catch (err) {
       console.error("MacDent rasp.find failed", err);
@@ -204,65 +175,61 @@ export class MacdentSchedule {
       const rows = extractBusyDateWindows(zapis, this.toZoned.bind(this));
       busy = rows.map(({ starts_at, ends_at }) => ({ starts_at, ends_at }));
       raspId = raspId ?? rows.find((r) => r.raspId)?.raspId ?? null;
+      const busyLabel = busy
+        .map(
+          (b) =>
+            `${formatTimeInTz(b.starts_at, CLINIC.timezone)}-${formatTimeInTz(b.ends_at, CLINIC.timezone)}`
+        )
+        .join(",");
       console.log(
-        `MacDent zapis doctor=${doctorId} date=${isoDate} busy=${busy.length} (empty zapis = free day)`
+        `MacDent zapis doctor=${doctorId} date=${isoDate} busy=${busy.length}${busyLabel ? ` [${busyLabel}]` : ""}`
       );
     } catch (err) {
       console.error("MacDent zapis.find failed", err);
     }
 
-    if (!windows.length && raspId) {
+    if (!workWindows.length && raspId) {
       try {
         const one = await this.api.call("rasp.get", { id: raspId, rasp: raspId });
         const parsedGet = extractRaspDayWindows(one, doctorId, isoDate);
-        if (parsedGet.windows.length) windows = parsedGet.windows;
+        if (parsedGet.windows.length) workWindows = parsedGet.windows;
         console.log(
-          `MacDent rasp.get id=${raspId} windows=${windows.map((w) => `${w.open_time}-${w.close_time}`).join(",") || "(empty)"}`
+          `MacDent rasp.get id=${raspId} windows=${workWindows.map((w) => `${w.open_time}-${w.close_time}`).join(",") || "(empty)"}`
         );
       } catch (err) {
         console.error("MacDent rasp.get failed", err);
       }
     }
 
-    if (!windows.length) {
-      try {
-        const data = await this.api.call("doctor.get_free_time", {
-          id: doctorId,
-          doctor: doctorId,
-          dateWhen: toMacdentDate(isoDate),
-        });
-        windows = extractScheduleWindows(data);
-        console.log(
-          `MacDent free windows doctor=${doctorId} ${windows.map((w) => `${w.open_time}-${w.close_time}`).join(",") || "(empty)"}`
-        );
-      } catch (err) {
-        console.error("MacDent doctor.get_free_time failed", err);
-      }
-    }
-
-    if (clinicHours) {
-      const gapWindows = this.gapsFromBusyAndClinic(isoDate, clinicHours, busy);
-      if (gapWindows.length) {
-        console.log(
-          `MacDent gap windows from zapis ${gapWindows.map((w) => `${w.open_time}-${w.close_time}`).join(",")}`
-        );
-      }
-      windows = mergeTimeWindows([...windows, ...gapWindows]);
-    }
-
-    // Empty rasp / empty get_free_time / empty zapis ≠ busy.
-    // On a working day with no appointments the whole clinic window is free.
-    if (!windows.length && clinicHours) {
-      windows = [{ open_time: clinicHours.open_time, close_time: clinicHours.close_time }];
+    // Рабочее окно врача: расписание MacDent, иначе часы клиники.
+    // Свободность считаем сами: duration + busy (get_free_time не знает длительность нашей процедуры).
+    if (!workWindows.length && clinicHours) {
+      workWindows = [
+        { open_time: clinicHours.open_time, close_time: clinicHours.close_time },
+      ];
       console.log(
-        `MacDent fallback clinic hours ${clinicHours.open_time}-${clinicHours.close_time} busy=${busy.length}`
+        `MacDent work windows from clinic hours ${clinicHours.open_time}-${clinicHours.close_time}`
       );
     }
 
-    return {
-      slots: this.slotsFromWindows(isoDate, durationMinutes, windows, busy),
-      raspId,
-    };
+    if (clinicHours && workWindows.length) {
+      // Не выходим за часы клиники
+      workWindows = intersectTimeWindows(workWindows, [
+        { open_time: clinicHours.open_time, close_time: clinicHours.close_time },
+      ]);
+    }
+
+    const slots = this.slotsFromWindows(
+      isoDate,
+      durationMinutes,
+      workWindows,
+      busy
+    );
+    console.log(
+      `MacDent slots duration=${durationMinutes}min → ${slots.join(",") || "(none)"}`
+    );
+
+    return { slots, raspId };
   }
 
   async findPatientByPhone(phone: string): Promise<string | null> {

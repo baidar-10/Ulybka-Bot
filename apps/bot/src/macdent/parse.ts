@@ -432,9 +432,42 @@ export function extractBusyDateWindows(
     if (!row || typeof row !== "object") continue;
     const rec = row as Record<string, unknown>;
     if (isCancelledStatus(rec.status ?? rec.sostoyanie ?? rec.state)) continue;
-    const start = parseMacdentWallClock(rec.start, toZonedDate);
-    const end = parseMacdentWallClock(rec.end, toZonedDate);
-    if (start && end && end > start) {
+
+    const start =
+      parseMacdentWallClock(rec.start, toZonedDate) ??
+      parseMacdentWallClock(rec.nachalo, toZonedDate) ??
+      parseMacdentWallClock(rec.time_start, toZonedDate) ??
+      parseMacdentWallClock(rec.from, toZonedDate);
+    let end =
+      parseMacdentWallClock(rec.end, toZonedDate) ??
+      parseMacdentWallClock(rec.konec, toZonedDate) ??
+      parseMacdentWallClock(rec.time_end, toZonedDate) ??
+      parseMacdentWallClock(rec.to, toZonedDate);
+
+    if (!start) continue;
+
+    // MacDent иногда отдаёт только начало — без конца запись «пропадает» из занятости
+    if (!end || end <= start) {
+      const durationField = pickNumber(rec, [
+        "duration",
+        "duration_minutes",
+        "dlitelnost",
+        "minutes",
+        "len",
+        "time_len",
+        "interval",
+      ]);
+      let durationMinutes = 30;
+      if (durationField != null && durationField > 0) {
+        // секунды vs минуты
+        durationMinutes =
+          durationField >= 24 * 60 ? Math.round(durationField / 60) : durationField;
+        durationMinutes = Math.max(durationMinutes, 15);
+      }
+      end = new Date(start.getTime() + durationMinutes * 60_000);
+    }
+
+    if (end > start) {
       busy.push({
         starts_at: start,
         ends_at: end,

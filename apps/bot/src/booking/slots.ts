@@ -123,6 +123,11 @@ export interface BusyInterval {
   ends_at: Date;
 }
 
+/**
+ * Свободные старты с шагом stepMinutes.
+ * Слот подходит только если весь интервал [start, start+duration) свободен:
+ * не пересекается ни с одной записью и укладывается в окно часов.
+ */
 export function generateSlots(params: {
   dateStr: string;
   durationMinutes: number;
@@ -142,14 +147,18 @@ export function generateSlots(params: {
     stepMinutes = SLOT_STEP_MINUTES,
   } = params;
 
-  if (!hours) return [];
+  if (!hours || durationMinutes <= 0) return [];
 
   const { year, month, day } = parseDateString(dateStr);
   const openMin = parseTimeToMinutes(String(hours.open_time).slice(0, 5));
   const closeMin = parseTimeToMinutes(String(hours.close_time).slice(0, 5));
   const slots: string[] = [];
 
-  for (let startMin = openMin; startMin + durationMinutes <= closeMin; startMin += stepMinutes) {
+  for (
+    let startMin = openMin;
+    startMin + durationMinutes <= closeMin;
+    startMin += stepMinutes
+  ) {
     const hour = Math.floor(startMin / 60);
     const minute = startMin % 60;
     const start = zonedDateTime(year, month, day, hour, minute, timeZone);
@@ -157,6 +166,7 @@ export function generateSlots(params: {
 
     if (start <= now) continue;
 
+    // Физическое перекрытие: наш приём [start,end) и чужая запись [b.starts,b.ends)
     const overlaps = busy.some(
       (b) => start < b.ends_at && end > b.starts_at
     );
@@ -166,6 +176,16 @@ export function generateSlots(params: {
   }
 
   return slots;
+}
+
+/** Есть ли непрерывное свободное окно нужной длительности с данного старта. */
+export function slotFitsBusy(
+  start: Date,
+  durationMinutes: number,
+  busy: BusyInterval[]
+): boolean {
+  const end = new Date(start.getTime() + durationMinutes * 60_000);
+  return !busy.some((b) => start < b.ends_at && end > b.starts_at);
 }
 
 export function slotToRange(params: {

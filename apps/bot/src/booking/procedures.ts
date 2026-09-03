@@ -99,7 +99,7 @@ export function resolveProcedureFromClientText(text: string): {
     return { procedure: matched, visitReason };
   }
 
-  // Не распознали категорию — слоты как консультация, причина = слова клиента
+  // Не распознали категорию — длительность как у консультации, причина = слова клиента
   return {
     procedure: getProcedure("consultation")!,
     visitReason,
@@ -131,14 +131,11 @@ export function matchProcedureFromText(
   if (/шов/i.test(t)) return getProcedure("suture_removal")!;
   if (/чистк|гигиен/i.test(t)) return getProcedure("cleaning")!;
   if (/консульт/i.test(t)) return getProcedure("consultation")!;
-  if (/^коррекц/i.test(t) || /\bкоррекц/i.test(t)) {
+  // Do not use \b — in JS it is ASCII-only and breaks on Cyrillic («лечение»)
+  if (/^коррекц/i.test(t) || /(^|[^а-яёa-z0-9])коррекц/i.test(t)) {
     return getProcedure("correction")!;
   }
-  if (
-    /^лечение\b/i.test(t) ||
-    /\bлечение\b/i.test(t) ||
-    /кариес|канал|пломб|пульпит/i.test(t)
-  ) {
+  if (/лечение|кариес|канал|пломб|пульпит/i.test(t)) {
     return getProcedure("treatment")!;
   }
 

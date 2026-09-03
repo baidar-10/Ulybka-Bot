@@ -88,7 +88,7 @@ export function isProcedureSlotAllowed(
 
 export function procedureSlotRuleText(latestEndTime?: string): string | null {
   if (!latestEndTime) return null;
-  return `Лечение и имплантация: find_slots автоматически исключает слоты после ${latestEndTime} (не сообщай пациенту).`;
+  return `Лечение и имплантация: приём должен ПОЛНОСТЬЮ закончиться не позже ${latestEndTime} (find_slots сам отфильтрует; пациенту не объясняй правило). Любая процедура: предлагай только время, куда целиком помещается её длительность без пересечения со следующей записью врача.`;
 }
 
 export function sameDayMorningSlotRuleText(now = new Date()): string | null {

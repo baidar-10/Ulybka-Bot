@@ -28,6 +28,7 @@ import {
 import { normalizePhone } from "./phone.js";
 import {
   getProcedure,
+  matchProcedureFromText,
   servicePatternsForProcedure,
   type ProcedureType,
 } from "./procedures.js";
@@ -148,11 +149,24 @@ export class BookingService {
     procedure: ProcedureType | null;
     reasonForVisit: string;
   }> {
-    const procedure = params.procedureType
+    let procedure = params.procedureType
       ? getProcedure(params.procedureType)
       : null;
     if (params.procedureType && !procedure) {
       throw new BookingError("Неизвестный тип процедуры");
+    }
+
+    // Причина визита важнее ошибочного procedure_type=consultation:
+    // длительность и отсечение по 19:00 берутся из реальной процедуры.
+    const fromReason = params.visitReason?.trim()
+      ? matchProcedureFromText(params.visitReason)
+      : null;
+    if (
+      fromReason &&
+      (!procedure ||
+        (procedure.id === "consultation" && fromReason.id !== "consultation"))
+    ) {
+      procedure = fromReason;
     }
 
     const service = procedure
@@ -385,7 +399,9 @@ export class BookingService {
     });
     if (!availability.slots.includes(params.time)) {
       throw new BookingError(
-        `Время ${params.time} недоступно для «${visitReason}». Свободно: ${availability.slots.join(", ") || "нет слотов"}`
+        availability.slots[0]
+          ? `К сожалению, на ${params.time} записаться нельзя. Могу предложить вам время в ${availability.slots[0]}. Подходит?`
+          : `К сожалению, на ${params.time} записаться нельзя. Подобрать другое время или день?`
       );
     }
 
@@ -452,7 +468,7 @@ export class BookingService {
     } catch (err: unknown) {
       if (isExclusionViolation(err)) {
         throw new BookingError(
-          "Это время только что заняли. Выберите другой слот."
+          "Это время только что заняли. Выберите другое время."
         );
       }
       throw err;
@@ -578,7 +594,9 @@ export class BookingService {
             });
             if (!slots.includes(params.time)) {
               throw new BookingError(
-                `Время ${params.time} недоступно. Свободно: ${slots.join(", ") || "нет слотов"}`
+                slots[0]
+                  ? `К сожалению, на ${params.time} записаться нельзя. Могу предложить вам время в ${slots[0]}. Подходит?`
+                  : `К сожалению, на ${params.time} записаться нельзя. Подобрать другое время или день?`
               );
             }
           }
@@ -671,7 +689,7 @@ export class BookingService {
     } catch (err: unknown) {
       if (isExclusionViolation(err)) {
         throw new BookingError(
-          "Это время только что заняли. Выберите другой слот."
+          "Это время только что заняли. Выберите другое время."
         );
       }
       throw err;

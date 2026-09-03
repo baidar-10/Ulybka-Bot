@@ -88,14 +88,14 @@ const tools: ChatCompletionTool[] = [
     function: {
       name: "find_slots",
       description:
-        "Проверка свободного времени врача на дату. Вызывай после ответа клиента о процедуре (procedure_type + visit_reason). Не перечисляй слоты — предложи одно время.",
+        "Проверка свободного времени врача на дату. Вызывай после ответа клиента о процедуре (procedure_type + visit_reason). Не перечисляй варианты — предложи одно время. Пациенту не говори «слот».",
       parameters: {
         type: "object",
         properties: {
           doctor_id: { type: "integer" },
           procedure_type: {
             type: "string",
-            description: "ID процедуры для расчёта слотов (consultation, treatment, …)",
+            description: "ID процедуры для расчёта длительности (consultation, treatment, …)",
           },
           visit_reason: {
             type: "string",
@@ -125,7 +125,7 @@ const tools: ChatCompletionTool[] = [
           doctor_id: { type: "integer" },
           procedure_type: {
             type: "string",
-            description: "ID процедуры для расчёта слотов",
+            description: "ID процедуры для расчёта длительности",
           },
           visit_reason: {
             type: "string",
@@ -168,7 +168,7 @@ const tools: ChatCompletionTool[] = [
     function: {
       name: "reschedule_appointment",
       description:
-        "Перенести запись. Вызывать только когда пациент согласился на конкретное время. Не предлагай перенос сам и не показывай список слотов.",
+        "Перенести запись. Вызывать только когда пациент согласился на конкретное время. Не предлагай перенос сам и не показывай список времён.",
       parameters: {
         type: "object",
         properties: {
@@ -257,16 +257,19 @@ consultation, treatment, cleaning, correction, crowns, crown_correction, extract
 1) Пока врач не выбран — список врачей. Не спрашивай дату и процедуру. Не вызывай find_slots.
 2) Врач выбран — спроси ОТКРЫТЫМ вопросом: «На какую процедуру вы хотите записаться?» Без списка вариантов. Не вызывай find_slots.
 3) Клиент назвал процедуру — запомни его формулировку как visit_reason (причина обращения в MacDent). Сопоставь с procedure_type через list_procedures. Спроси дату.
-4) Дата есть — find_slots с procedure_type и visit_reason. Слоты подбираются автоматически.
-   Свободно: «Вам подойдёт в {время}?» Занято: предложи suggested. Без списка слотов.
-   Не сообщай пациенту длительность и внутренние ограничения.
+4) Дата есть — find_slots с procedure_type и visit_reason.
+   Время подбирается автоматически: длительность процедуры + занятость врача из MacDent.
+   Предлагай только то, что вернул find_slots (туда уже не попадают пересечения со следующей записью).
+   Лечение/имплантация: приём должен закончиться до 19:00 — find_slots это учитывает сам.
+   Свободно: «Вам подойдёт в {время}?» Занято: предложи suggested. Одно время, без списка.
+   Не сообщай пациенту длительность, внутренние ограничения и слово «слот/слоты».
 5) Время подтверждено — если ФИО уже в системе, не спрашивай. Иначе попроси ФИО.
 6) ФИО известно — переспроси запись и жди «да» → book_appointment с procedure_type и visit_reason (comment = visit_reason).
    После успешной записи отправь пациенту confirmation_message из ответа tool без изменений.
 
-Запрещено нумеровать слоты (1) 10:00 2) 10:30 …). Запрещено писать «подтверждаете перенос», если это новая запись.
+Запрещено нумеровать время (1) 10:00 2) 10:30 …). Запрещено слово «слот» в любой форме. Запрещено писать «подтверждаете перенос», если это новая запись.
 
-«Консультация» без имени врача = шаг 1, не слоты Асель и не вопрос про дату.
+«Консультация» без имени врача = шаг 1, не подбор времени к Асель и не вопрос про дату.
 
 Перенос существующей записи: find_slots, предложи одно время так же («Вам подойдёт в …?»), не список.
 WhatsApp: без markdown. Телефон не спрашивай.
@@ -277,6 +280,15 @@ function prependDailyGreeting(greeting: string, body: string): string {
   const trimmed = body.trim();
   if (!trimmed) return greeting;
   return `${greeting}\n\n${trimmed}`;
+}
+
+function stripClientJargon(text: string): string {
+  return text
+    .replace(/свободн(?:ые|ых|ое|ого)?\s+слот(?:ы|ов|а|у|ам|ами|ах)?/gi, "свободное время")
+    .replace(/нет\s+слот(?:ов|а)?/gi, "нет свободного времени")
+    .replace(/другой\s+слот/gi, "другое время")
+    .replace(/список\s+слот(?:ов)?/gi, "варианты времени")
+    .replace(/слот(?:ы|ов|а|у|ам|ами|ах)?/gi, "время");
 }
 
 function stripWhatsAppMarkdown(text: string): string {
@@ -298,7 +310,7 @@ function stripWhatsAppMarkdown(text: string): string {
       }
     }
   }
-  return out.trim();
+  return stripClientJargon(out.trim());
 }
 
 
@@ -531,10 +543,11 @@ function lastAssistantOfferedSlot(history: ConversationMessage[]): string | null
     .find((m) => m.role === "assistant" && m.content);
   if (!last?.content) return null;
   const m =
-    last.content.match(/подойдёт в (\d{1,2}:\d{2})/i) ||
-    last.content.match(/предложить (\d{1,2}:\d{2})/i) ||
-    last.content.match(/Могу предложить (\d{1,2}:\d{2})/i) ||
+    last.content.match(/подойдёт(?:\s+время)?\s+в\s+(\d{1,2}:\d{2})/i) ||
+    last.content.match(/предложить(?:\s+вам)?(?:\s+время)?\s+в\s+(\d{1,2}:\d{2})/i) ||
+    last.content.match(/время в (\d{1,2}:\d{2})/i) ||
     last.content.match(/перенести[^?]*на (\d{1,2}:\d{2})/i) ||
+    last.content.match(/в (\d{1,2}:\d{2})(?:\s*[.!]|\s+всё верно|\s+подтвержда)/i) ||
     last.content.match(/на (\d{1,2}:\d{2})\?/i);
   return m ? normalizeSlotTime(m[1]) : null;
 }
@@ -866,14 +879,20 @@ function weekdayNameToDow(name: string): number | null {
 }
 
 function parseRequestedDate(text: string): string | null {
-  const t = text.toLowerCase();
-  if (/\bсегодня\b/.test(t)) return todayIso();
-  if (/\bзавтра\b/.test(t)) return tomorrowIso();
+  // Do not use \b — ASCII-only; breaks on Cyrillic («Завтра вечером»)
+  const t = ` ${text.trim().toLowerCase()} `;
+  if (/(^|[^а-яёa-z0-9])сегодня([^а-яёa-z0-9]|$)/i.test(t)) return todayIso();
+  if (/(^|[^а-яёa-z0-9])завтра([^а-яёa-z0-9]|$)/i.test(t)) return tomorrowIso();
+  if (/(^|[^а-яёa-z0-9])послезавтра([^а-яёa-z0-9]|$)/i.test(t)) {
+    const d = new Date();
+    d.setDate(d.getDate() + 2);
+    return formatDateInTz(d, CLINIC.timezone);
+  }
   const wd = t.match(
-    /\b(понедельник|вторник|сред[ауы]?|четверг|пятниц[ауы]?|суббот[ауы]?|воскресень[ея]?)\b/i
+    /(^|[^а-яёa-z0-9])(понедельник|вторник|сред[ауы]?|четверг|пятниц[ауы]?|суббот[ауы]?|воскресень[ея]?)([^а-яёa-z0-9]|$)/i
   );
   if (wd) {
-    const dow = weekdayNameToDow(wd[1]);
+    const dow = weekdayNameToDow(wd[2]);
     if (dow != null) return nextIsoDateForWeekday(dow, CLINIC.timezone);
   }
   return null;
@@ -1373,11 +1392,12 @@ export class DialogOrchestrator {
       const doctorId = resolveDoctorId(text, history, doctors);
       const doc = doctors.find((d) => d.id === doctorId);
       const procedureLabel =
-        prevSlots?.visit_reason ??
         prevSlots?.procedure_label ??
         (prevSlots?.procedure_type
           ? PROCEDURES.find((p) => p.id === prevSlots.procedure_type)?.label
-          : null);
+          : null) ??
+        prevSlots?.visit_reason ??
+        null;
       if (fio && doc && slotOk && !historyAwaitingFinalConfirmation(history)) {
         const procedurePart = procedureLabel ? `, ${procedureLabel}` : "";
         const reply = `Отлично! Подтвердите, пожалуйста: ${fio}${procedurePart}, врач ${doctorDisplayName(doc.full_name)}, ${prevSlots.date} в ${offeredSlot}. Всё верно?`;
@@ -1422,12 +1442,50 @@ export class DialogOrchestrator {
           await saveConversation(phone, history);
           return finalize(reply);
         } catch (err) {
-          const reply =
+          let reply =
             err instanceof BookingError
               ? err.message
               : "Не удалось создать запись. Попробуйте ещё раз.";
           if (history.length === 0) {
             history = [{ role: "system", content: systemPrompt() }];
+          }
+          // Обновим доступное время, чтобы следующее «да» брало актуальное предложение
+          if (doctorId && prevSlots?.date && prevSlots.procedure_type) {
+            try {
+              const result = await this.booking.findSlots({
+                doctorId,
+                date: prevSlots.date,
+                procedureType: prevSlots.procedure_type,
+                visitReason: prevSlots.visit_reason ?? undefined,
+              });
+              const alt = result.slots.find(
+                (t) => normalizeSlotTime(t) !== offeredSlot
+              ) ?? result.slots[0];
+              if (alt) {
+                reply = `К сожалению, на ${offeredSlot} записаться нельзя. Могу предложить вам время в ${alt}. Подходит?`;
+                pushDeterministicToolExchange(
+                  history,
+                  text,
+                  "find_slots",
+                  {
+                    doctor_id: doctorId,
+                    date: prevSlots.date,
+                    procedure_type: prevSlots.procedure_type,
+                    visit_reason: prevSlots.visit_reason,
+                  },
+                  JSON.stringify({
+                    ...result,
+                    slots: result.slots,
+                    slots_total: result.slots.length,
+                  }),
+                  reply
+                );
+                await saveConversation(phone, history);
+                return finalize(reply);
+              }
+            } catch (refreshErr) {
+              console.error("refresh slots after book failure", refreshErr);
+            }
           }
           history.push({ role: "user", content: text });
           history.push({ role: "assistant", content: reply });
@@ -1690,7 +1748,7 @@ export class DialogOrchestrator {
               ? `Пациент просил ${pick.requested}. Оно свободно. Спроси: «Вам подойдёт в ${pick.suggested}?» Без списка.`
               : pick.requested
                 ? `${pick.requested} занято (или не влезает в окно). Предложи ближайшее: «${pick.requested} занято. Вам подойдёт в ${pick.suggested}?» Не предлагай 10:00, если suggested другое.`
-                : `Одно время: «Вам подойдёт в ${pick.suggested}?» Без списка слотов.`,
+                : `Одно время: «Вам подойдёт в ${pick.suggested}?» Без списка вариантов.`,
           });
         }
         case "list_services": {
