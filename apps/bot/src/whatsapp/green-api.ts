@@ -70,12 +70,24 @@ export function createGreenApiProvider(
     }
   }
 
-  async function receiveOnce(timeoutSec = 1): Promise<GreenNotification | null> {
-    const url = `${instanceBase()}/receiveNotification/${token()}?receiveTimeout=${timeoutSec}`;
+  async function receiveOnce(timeoutSec = 5): Promise<GreenNotification | null> {
+    // Green API requires receiveTimeout between 5 and 60 seconds
+    const wait = Math.min(60, Math.max(5, timeoutSec));
+    const url = `${instanceBase()}/receiveNotification/${token()}?receiveTimeout=${wait}`;
     const res = await fetch(url);
-    if (res.status !== 200) return null;
-    // Empty body / "null" = no notifications in queue
     const raw = (await res.text()).trim();
+    if (res.status !== 200) {
+      console.error(
+        `GREEN-API receiveNotification HTTP ${res.status}: ${raw.slice(0, 300) || "(empty)"}`
+      );
+      if (/webhook url is set/i.test(raw)) {
+        console.error(
+          "GREEN-API: очистите webhookUrl в кабинете (или подождите ~1 мин после setSettings) — иначе очередь HTTP API не работает."
+        );
+      }
+      return null;
+    }
+    // Empty body / "null" = no notifications in queue
     if (!raw || raw === "null") return null;
     let data: GreenNotification | null;
     try {
@@ -92,7 +104,7 @@ export function createGreenApiProvider(
   async function flushQueue(): Promise<number> {
     let cleared = 0;
     for (let i = 0; i < 200; i++) {
-      const n = await receiveOnce(1);
+      const n = await receiveOnce(5);
       if (!n) break;
       await deleteNotification(n.receiptId);
       cleared += 1;
@@ -107,6 +119,7 @@ export function createGreenApiProvider(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         webhookUrl: "",
+        webhookUrlToken: "",
         incomingWebhook: "yes",
         outgoingWebhook: "no",
         outgoingAPIMessageWebhook: "no",
@@ -120,7 +133,27 @@ export function createGreenApiProvider(
       const body = await res.text();
       console.warn(`GREEN-API setSettings warning: ${res.status} ${body}`);
     } else {
-      console.log("GREEN-API: incoming via receiveNotification (HTTP API)");
+      console.log("GREEN-API: webhookUrl cleared, incoming via receiveNotification");
+    }
+
+    try {
+      const settingsRes = await fetch(`${instanceBase()}/getSettings/${token()}`);
+      if (settingsRes.ok) {
+        const settings = (await settingsRes.json()) as {
+          webhookUrl?: string;
+          incomingWebhook?: string;
+        };
+        console.log(
+          `GREEN-API settings: webhookUrl="${settings.webhookUrl || ""}" incomingWebhook=${settings.incomingWebhook || "?"}`
+        );
+        if (settings.webhookUrl) {
+          console.error(
+            `GREEN-API: webhookUrl всё ещё задан (${settings.webhookUrl}) — receiveNotification не будет работать, пока URL не очистите в кабинете.`
+          );
+        }
+      }
+    } catch (err) {
+      console.warn("GREEN-API getSettings failed", err);
     }
   }
 
