@@ -37,6 +37,7 @@ import {
 import {
   formatProcedureQuestion,
   listProcedures,
+  matchProcedureFromText,
   PROCEDURES,
   resolveProcedureFromClientText,
   textDescribesProcedure,
@@ -858,9 +859,34 @@ function inNewBookingFlow(history: ConversationMessage[]): boolean {
 }
 
 function looksLikeRescheduleRequest(text: string): boolean {
-  return /изменить|перенест|перенос|поменять|на другое время|другое время/i.test(
+  return /изменить|перенест|перенос|поменять|на другое время|другое время|перепиши|сдвин/i.test(
     text.toLowerCase()
   );
+}
+
+/** Какую запись переносим: дата из диалога (только что записали) → самая свежая запись. */
+function pickAppointmentForReschedule(
+  list: { id: number; starts_at: Date; doctor_id: number; service_id: number; comment?: string | null }[],
+  _text: string,
+  history: ConversationMessage[]
+): (typeof list)[0] {
+  const fromSlots = lastFindSlotsPayload(history)?.date;
+  if (fromSlots) {
+    const bySlots = list.find(
+      (a) => formatDateInTz(a.starts_at, CLINIC.timezone) === fromSlots
+    );
+    if (bySlots) return bySlots;
+  }
+
+  // Не list[0] (самая ранняя дата) — берём только что созданную
+  return [...list].sort((a, b) => b.id - a.id)[0];
+}
+
+function procedureTypeFromAppointmentComment(
+  comment: string | null | undefined
+): string | undefined {
+  if (!comment?.trim()) return undefined;
+  return matchProcedureFromText(comment)?.id;
 }
 
 function historyHasRescheduleIntent(history: ConversationMessage[]): boolean {
@@ -1191,21 +1217,25 @@ export class DialogOrchestrator {
         return finalize(reply);
       }
 
-      const appt =
-        list.find(
-          (a) =>
-            parseRequestedDate(text) &&
-            formatDateInTz(a.starts_at, CLINIC.timezone) === parseRequestedDate(text)
-        ) ?? list[0];
-      const date = formatDateInTz(appt.starts_at, CLINIC.timezone);
+      const appt = pickAppointmentForReschedule(list, text, history);
+      // Новая дата из сообщения, иначе дата текущей записи (не «ближайший свободный день»)
+      const date =
+        parseRequestedDate(text) ??
+        formatDateInTz(appt.starts_at, CLINIC.timezone);
       const oldTime = formatTimeInTz(appt.starts_at, CLINIC.timezone);
       const preferred = parsePreferredTime(text);
+      const procedureType =
+        procedureTypeFromAppointmentComment(appt.comment) ??
+        lastFindSlotsPayload(history)?.procedure_type ??
+        undefined;
 
       try {
         const result = await this.booking.findSlots({
           doctorId: appt.doctor_id,
           date,
           serviceId: appt.service_id,
+          procedureType,
+          visitReason: appt.comment ?? undefined,
         });
         let reply: string;
         if (!result.slots.length) {
@@ -1213,20 +1243,23 @@ export class DialogOrchestrator {
         } else if (preferred) {
           const pick = pickSuggestedSlot(result.slots, preferred);
           if (pick.requested_free) {
-            reply = `Конечно! Перенести вашу запись с ${oldTime} на ${preferred}?`;
+            reply = `Конечно! Перенести вашу запись ${formatDateHumanRu(date)} с ${oldTime} на ${preferred}?`;
           } else if (pick.suggested) {
-            reply = `${preferred} занято. Могу перенести на ${pick.suggested} — подойдёт?`;
+            reply = `${preferred} занято. Могу перенести на ${formatDateHumanRu(date)} в ${pick.suggested} — подойдёт?`;
           } else {
-            reply = `На этот день свободных окон нет. Подобрать другой день?`;
+            reply = `На ${formatDateHumanRu(date)} свободных окон нет. Подобрать другой день?`;
           }
         } else {
-          reply = `Сейчас у вас запись в ${oldTime}. На какое время перенести?`;
+          reply = `Сейчас у вас запись ${formatDateHumanRu(date)} в ${oldTime}. На какое время перенести?`;
         }
 
         const toolPayload = JSON.stringify({
           ...result,
+          date,
           slots: result.slots,
           reschedule_appointment_id: appt.id,
+          procedure_type: procedureType ?? result.procedure_type,
+          visit_reason: appt.comment ?? result.visit_reason,
         });
         if (history.length === 0) {
           history = [{ role: "system", content: systemPrompt() }];
@@ -1235,7 +1268,12 @@ export class DialogOrchestrator {
           history,
           text,
           "find_slots",
-          { doctor_id: appt.doctor_id, date, service_id: appt.service_id },
+          {
+            doctor_id: appt.doctor_id,
+            date,
+            service_id: appt.service_id,
+            procedure_type: procedureType,
+          },
           toolPayload,
           reply
         );
@@ -1610,6 +1648,10 @@ export class DialogOrchestrator {
             doctorName: appt.doctor_name ?? "врачу",
             date: prevSlots.date!,
             time: offeredSlot,
+            procedureLabel:
+              prevSlots.procedure_label ??
+              prevSlots.visit_reason ??
+              procedureLabel,
           });
           if (history.length === 0) {
             history = [{ role: "system", content: systemPrompt() }];
@@ -1990,6 +2032,10 @@ export class DialogOrchestrator {
             doctorName: appt.doctor_name ?? "врачу",
             date: String(args.date),
             time: String(args.time),
+            procedureLabel:
+              visitReason ||
+              PROCEDURES.find((p) => p.id === procedureType)?.label ||
+              appt.service_name,
           });
           return JSON.stringify({
             ok: true,

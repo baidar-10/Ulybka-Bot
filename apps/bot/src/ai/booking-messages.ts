@@ -26,14 +26,16 @@ export function formatBookingConfirmation(params: {
   doctorName: string;
   date: string;
   time: string;
+  procedureLabel?: string | null;
 }): string {
   const doctor = doctorNameInDative(params.doctorName);
   const dateHuman = formatDateHumanRu(params.date);
+  const procedure = (params.procedureLabel || "приём").trim();
   const addressLine = CLINIC.address
     ? `\n\nБудем ждать вас по адресу ${CLINIC.address}`
     : "";
 
-  return `Вы успешно записаны на консультацию к ${doctor}, ${dateHuman} в ${params.time}.${addressLine}
+  return `Вы успешно записаны на ${procedure} к ${doctor}, ${dateHuman} в ${params.time}.${addressLine}
 
 Если у вас возникнут вопросы или понадобится помощь, не стесняйтесь обращаться! Ждем вас в нашей клинике! 🦷✨`;
 }
