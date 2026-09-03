@@ -74,7 +74,16 @@ export function createGreenApiProvider(
     const url = `${instanceBase()}/receiveNotification/${token()}?receiveTimeout=${timeoutSec}`;
     const res = await fetch(url);
     if (res.status !== 200) return null;
-    const data = (await res.json()) as GreenNotification | null;
+    // Empty body / "null" = no notifications in queue
+    const raw = (await res.text()).trim();
+    if (!raw || raw === "null") return null;
+    let data: GreenNotification | null;
+    try {
+      data = JSON.parse(raw) as GreenNotification | null;
+    } catch {
+      console.warn(`GREEN-API receiveNotification: invalid JSON (${raw.slice(0, 80)})`);
+      return null;
+    }
     if (!data || data.receiptId == null) return null;
     return data;
   }
