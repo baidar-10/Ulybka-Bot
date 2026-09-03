@@ -383,9 +383,9 @@ export class BookingService {
         (await getKnownPatient(params.phone))?.patient_name ||
         ""
     );
-    if (patientFio.split(" ").length < 3) {
+    if (patientFio.split(" ").length < 2) {
       throw new BookingError(
-        "Подскажите, пожалуйста, полное имя — фамилию, имя и отчество — чтобы оформить запись"
+        "Подскажите, пожалуйста, фамилию и имя — чтобы оформить запись"
       );
     }
 

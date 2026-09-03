@@ -26,7 +26,7 @@ export function buildDailyGreeting(isReturning: boolean, now = new Date()): stri
 }
 
 export function isGreetingOnly(text: string): boolean {
-  return /^(привет|здравствуйте|здравстуйте|добрый\s+(день|вечер|утро)|hello|hi|hey)[\s!.]*$/i.test(
+  return /^(привет|здравствуйте|здравстуйте|добрый\s+(день|вечер|утро)|салам\s*алейкум|ассаламу?\s*алейкум|ассаламуалейкум|hello|hi|hey)[\s!.]*$/i.test(
     text.trim()
   );
 }
