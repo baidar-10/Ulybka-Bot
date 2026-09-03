@@ -333,9 +333,9 @@ export function createGreenApiProvider(
       "GREEN-API: primary listen = lastIncomingMessages journal (queue often empty on this instance)"
     );
     let journalBackoffUntil = 0;
+    let queueErrors = 0;
     while (!stopping) {
       try {
-        // Prefer journal; touch queue only lightly (empty queue is normal here)
         if (Date.now() >= journalBackoffUntil) {
           try {
             await pollJournalOnce();
@@ -348,13 +348,32 @@ export function createGreenApiProvider(
           }
         }
 
-        // Non-blocking-ish queue check with minimum timeout
-        const n = await receiveOnce(5);
-        if (n) {
+        // Skip queue polling after repeated connect timeouts (journal is enough)
+        if (queueErrors < 5) {
           try {
-            await handleNotification(n);
-          } finally {
-            await deleteNotification(n.receiptId);
+            const n = await receiveOnce(5);
+            if (n) {
+              queueErrors = 0;
+              try {
+                await handleNotification(n);
+              } finally {
+                await deleteNotification(n.receiptId);
+              }
+            } else {
+              await sleep(JOURNAL_POLL_MS);
+            }
+          } catch (err) {
+            queueErrors += 1;
+            const cause = err as { cause?: { code?: string }; code?: string };
+            const code = cause?.cause?.code || cause?.code || "";
+            if (code === "UND_ERR_CONNECT_TIMEOUT" || /fetch failed/i.test(String(err))) {
+              console.warn(
+                `GREEN-API queue poll timeout (${queueErrors}/5) — продолжаем через journal`
+              );
+            } else {
+              console.error("GREEN-API queue poll error", err);
+            }
+            await sleep(JOURNAL_POLL_MS);
           }
         } else {
           await sleep(JOURNAL_POLL_MS);

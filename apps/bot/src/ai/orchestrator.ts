@@ -667,8 +667,9 @@ function historyAwaitingProcedureAnswer(
 }
 
 function mentionsBookingDate(text: string): boolean {
-  return /\b(сегодня|завтра|послезавтра|понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|\d{1,2}[./]\d{1,2})\b/i.test(
-    text
+  // Do not use \b — in JS it is ASCII-only and breaks on Cyrillic («завтра»)
+  return /(^|[^а-яёa-z0-9])(сегодня|завтра|послезавтра|понедельник|вторник|сред[ауы]?|четверг|пятниц[ауы]?|суббот[ауы]?|воскресень[ея]?|\d{1,2}[./]\d{1,2})([^а-яёa-z0-9]|$)/i.test(
+    ` ${text.trim()} `
   );
 }
 
@@ -822,24 +823,27 @@ function wantsNewBooking(text: string): boolean {
 function looksLikeDateOnly(text: string): boolean {
   const t = text.trim();
   if (
-    /^(на\s+)?(понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|сегодня|завтра|послезавтра)\b/i.test(
+    /^(на\s+)?(понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|сегодня|завтра|послезавтра)([^а-яёa-z0-9]|$)/i.test(
       t
     )
   ) {
     return true;
   }
-  if (/\bна\s+(сегодня|завтра|послезавтра)\b/i.test(t)) return true;
   if (
-    /\b(сегодня|завтра|послезавтра|понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень)\b/i.test(
+    /(^|[^а-яёa-z0-9])на\s+(сегодня|завтра|послезавтра)([^а-яёa-z0-9]|$)/i.test(
       t
-    ) &&
+    )
+  ) {
+    return true;
+  }
+  if (
+    mentionsBookingDate(t) &&
     /^(можно|хочу|на|давайте|запиш|удобн|прийти|могу|есть|в)\b/i.test(t)
   ) {
     return true;
   }
-  // «можно в пятницу», «давайте в четверг»
   if (
-    /^(можно|хочу|давайте|запишите)?\s*(в|на)?\s*(понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|сегодня|завтра)\b/i.test(
+    /^(можно|хочу|давайте|запишите)?\s*(в|на)?\s*(понедельник|вторник|сред[ауы]?|четверг|пятниц|суббот|воскресень|сегодня|завтра)([^а-яёa-z0-9]|$)/i.test(
       t
     )
   ) {
@@ -1165,13 +1169,15 @@ export class DialogOrchestrator {
     }
 
     const procedureIntent = resolveProcedureIntent(text, history);
+    // Ask for date only immediately after the client answered the procedure question
     if (
       doctorChosen &&
       procedureIntent &&
+      historyAwaitingProcedureAnswer(history) &&
+      looksLikeProcedureAnswer(text) &&
       !looksLikeDateOnly(text) &&
       !mentionsBookingDate(text) &&
-      !historyAwaitingFio(history) &&
-      !lastFindSlotsPayload(history)
+      !historyAwaitingFio(history)
     ) {
       const reply =
         "Отлично! Когда вам было бы удобно прийти? Можно назвать день недели или дату.";
@@ -1243,7 +1249,12 @@ export class DialogOrchestrator {
             history,
             text,
             "find_slots",
-            { doctor_id: doctorId, date, procedure_type: resolvedProcedure.procedureType, visit_reason: resolvedProcedure.visitReason },
+            {
+              doctor_id: doctorId,
+              date,
+              procedure_type: resolvedProcedure.procedureType,
+              visit_reason: resolvedProcedure.visitReason,
+            },
             toolPayload,
             reply
           );
@@ -1251,6 +1262,17 @@ export class DialogOrchestrator {
           return finalize(reply);
         } catch (err) {
           console.error("deterministic find_slots failed", err);
+          const reply =
+            err instanceof BookingError
+              ? err.message
+              : "Не удалось проверить свободное время. Напишите день ещё раз, пожалуйста.";
+          if (history.length === 0) {
+            history = [{ role: "system", content: systemPrompt() }];
+          }
+          history.push({ role: "user", content: text });
+          history.push({ role: "assistant", content: reply });
+          await saveConversation(phone, history);
+          return finalize(reply);
         }
       }
     }
