@@ -405,7 +405,7 @@ export function extractBusyWindows(
     const endRaw = pickString(rec, ["to", "konec", "time_end", "end_time"]);
     const start = startRaw ? normalizeTime(startRaw) : null;
     if (!start) continue;
-    let durationMinutes = 30;
+    let durationMinutes = 60;
     const end = endRaw ? normalizeTime(endRaw) : null;
     if (end) {
       const [sh, sm] = start.split(":").map(Number);
@@ -425,7 +425,8 @@ export function extractBusyDateWindows(
     day: number,
     hour: number,
     minute: number
-  ) => Date
+  ) => Date,
+  fallbackDurationMinutes = 60
 ): { starts_at: Date; ends_at: Date; raspId: string | null }[] {
   const busy: { starts_at: Date; ends_at: Date; raspId: string | null }[] = [];
   for (const row of asArray(value)) {
@@ -446,7 +447,8 @@ export function extractBusyDateWindows(
 
     if (!start) continue;
 
-    // MacDent иногда отдаёт только начало — без конца запись «пропадает» из занятости
+    // MacDent иногда отдаёт только начало — без конца запись «пропадает» из занятости.
+    // Дефолт 60 мин (не 30): иначе длинные приёмы дают ложные «свободные» окна.
     if (!end || end <= start) {
       const durationField = pickNumber(rec, [
         "duration",
@@ -457,7 +459,7 @@ export function extractBusyDateWindows(
         "time_len",
         "interval",
       ]);
-      let durationMinutes = 30;
+      let durationMinutes = fallbackDurationMinutes;
       if (durationField != null && durationField > 0) {
         // секунды vs минуты
         durationMinutes =

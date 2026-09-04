@@ -1,6 +1,7 @@
 import { env } from "../config/env.js";
 import type { DialogOrchestrator } from "../ai/orchestrator.js";
 import { normalizePhone } from "../booking/phone.js";
+import { createDebouncedIngress, createPhoneQueue } from "./phone-queue.js";
 import type { WhatsAppProvider } from "./provider.js";
 
 export type { WhatsAppProvider } from "./provider.js";
@@ -9,6 +10,10 @@ export type { WhatsAppProvider } from "./provider.js";
 const JOURNAL_MAX_AGE_MS = 10 * 60 * 1000;
 const JOURNAL_POLL_MS = 8000;
 const JOURNAL_BACKOFF_MS = 30000;
+/** Parallel dialogs across different phones */
+const MAX_CONCURRENT_DIALOGS = 5;
+/** Join rapid messages from the same phone into one turn */
+const MESSAGE_COALESCE_MS = 1200;
 
 interface JournalMessage {
   type?: string;
@@ -59,6 +64,40 @@ export function createGreenApiProvider(
   let readyAt = 0;
   const processing = new Set<string>();
   const processedIds = new Set<string>();
+  const queue = createPhoneQueue({ maxConcurrent: MAX_CONCURRENT_DIALOGS });
+  const ingress = createDebouncedIngress<{
+    idMessage: string;
+    source: string;
+  }>({
+    queue,
+    delayMs: MESSAGE_COALESCE_MS,
+    combineTexts: (texts) => texts.join("\n").trim(),
+    async run({ phone, text, metas }) {
+      const sources = [...new Set(metas.map((m) => m.source))].join("+");
+      try {
+        console.log(
+          `GREEN-API incoming (${sources}) from ${phone}: ${text.slice(0, 120)}`
+        );
+        const reply = await orchestrator.handleMessage({ phone, text });
+        await sendText(phone, reply);
+      } catch (err) {
+        console.error("Failed to handle GREEN-API message", err);
+        try {
+          await sendText(
+            phone,
+            "Произошла ошибка. Попробуйте ещё раз чуть позже."
+          );
+        } catch {
+          /* ignore */
+        }
+      } finally {
+        for (const m of metas) {
+          rememberId(m.idMessage);
+          processing.delete(m.idMessage);
+        }
+      }
+    },
+  });
 
   function rememberId(id: string): void {
     processedIds.add(id);
@@ -226,38 +265,22 @@ export function createGreenApiProvider(
     return data.stateInstance || "unknown";
   }
 
-  async function handleIncoming(params: {
+  /** Buffer + enqueue without waiting for LLM — poll loop stays free for other users. */
+  function enqueueIncoming(params: {
     idMessage: string;
     phone: string;
     text: string;
     source: string;
-  }): Promise<void> {
+  }): boolean {
     const { idMessage, phone, text, source } = params;
-    if (!phone || !text) return;
-    if (processedIds.has(idMessage) || processing.has(idMessage)) return;
+    if (!phone || !text) return false;
+    if (processedIds.has(idMessage) || processing.has(idMessage)) return false;
     processing.add(idMessage);
-    rememberId(idMessage);
-
-    try {
-      console.log(`GREEN-API incoming (${source}) from ${phone}: ${text.slice(0, 80)}`);
-      const reply = await orchestrator.handleMessage({ phone, text });
-      await sendText(phone, reply);
-    } catch (err) {
-      console.error("Failed to handle GREEN-API message", err);
-      try {
-        await sendText(
-          phone,
-          "Произошла ошибка. Попробуйте ещё раз чуть позже."
-        );
-      } catch {
-        /* ignore */
-      }
-    } finally {
-      processing.delete(idMessage);
-    }
+    ingress.push(phone, text, { idMessage, source });
+    return true;
   }
 
-  async function handleNotification(n: GreenNotification): Promise<void> {
+  function handleNotification(n: GreenNotification): void {
     if (n.body.typeWebhook !== "incomingMessageReceived") return;
     const chatId = n.body.senderData?.chatId || "";
     if (chatId.endsWith("@g.us") || chatId.includes("status@broadcast")) return;
@@ -281,16 +304,18 @@ export function createGreenApiProvider(
     const raw = sender || chatId;
     const phone = normalizePhone(raw.split("@")[0] || "");
     const idMessage = n.body.idMessage || `${phone}:${n.receiptId}`;
-    await handleIncoming({ idMessage, phone, text, source: "queue" });
+    enqueueIncoming({ idMessage, phone, text, source: "queue" });
   }
 
   async function pollJournalOnce(): Promise<number> {
     const list = await fetchJournal(15);
-    let handled = 0;
-    // Process oldest first
+    let enqueued = 0;
+    // Oldest first
     const ordered = [...list].reverse();
     for (const m of ordered) {
-      if (!m.idMessage || processedIds.has(m.idMessage)) continue;
+      if (!m.idMessage || processedIds.has(m.idMessage) || processing.has(m.idMessage)) {
+        continue;
+      }
       if (m.typeMessage !== "textMessage" && m.typeMessage !== "extendedTextMessage") {
         rememberId(m.idMessage);
         continue;
@@ -312,20 +337,26 @@ export function createGreenApiProvider(
         continue;
       }
       if (ts && Date.now() - ts > JOURNAL_MAX_AGE_MS) {
+        console.warn(
+          `GREEN-API skip stale journal message ${m.idMessage} age=${Math.round((Date.now() - ts) / 1000)}s`
+        );
         rememberId(m.idMessage);
         continue;
       }
 
       const phone = normalizePhone((m.senderId || chatId).split("@")[0] || "");
-      await handleIncoming({
-        idMessage: m.idMessage,
-        phone,
-        text,
-        source: "journal",
-      });
-      handled += 1;
+      if (
+        enqueueIncoming({
+          idMessage: m.idMessage,
+          phone,
+          text,
+          source: "journal",
+        })
+      ) {
+        enqueued += 1;
+      }
     }
-    return handled;
+    return enqueued;
   }
 
   async function pollLoop(): Promise<void> {
@@ -355,7 +386,7 @@ export function createGreenApiProvider(
             if (n) {
               queueErrors = 0;
               try {
-                await handleNotification(n);
+                handleNotification(n);
               } finally {
                 await deleteNotification(n.receiptId);
               }
@@ -410,7 +441,9 @@ export function createGreenApiProvider(
       console.log(`GREEN-API: cleared ${cleared} queue notification(s)`);
       await primeJournal();
       readyAt = Date.now();
-      console.log("GREEN-API: now listening for NEW messages only");
+      console.log(
+        `GREEN-API: now listening for NEW messages only (up to ${MAX_CONCURRENT_DIALOGS} parallel dialogs)`
+      );
 
       loopPromise = pollLoop();
     },
@@ -419,6 +452,7 @@ export function createGreenApiProvider(
       if (loopPromise) {
         await Promise.race([loopPromise, sleep(1500)]);
       }
+      await ingress.drain(5000);
     },
     sendText,
   };

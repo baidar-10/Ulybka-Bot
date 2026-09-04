@@ -399,9 +399,7 @@ export class BookingService {
     });
     if (!availability.slots.includes(params.time)) {
       throw new BookingError(
-        availability.slots[0]
-          ? `К сожалению, на ${params.time} записаться нельзя. Могу предложить вам время в ${availability.slots[0]}. Подходит?`
-          : `К сожалению, на ${params.time} записаться нельзя. Подобрать другое время или день?`
+        `К сожалению, на ${params.time} уже нельзя записаться — это время заняли. Подскажите другой день или время?`
       );
     }
 
@@ -594,9 +592,7 @@ export class BookingService {
             });
             if (!slots.includes(params.time)) {
               throw new BookingError(
-                slots[0]
-                  ? `К сожалению, на ${params.time} записаться нельзя. Могу предложить вам время в ${slots[0]}. Подходит?`
-                  : `К сожалению, на ${params.time} записаться нельзя. Подобрать другое время или день?`
+                `К сожалению, на ${params.time} уже нельзя записаться — это время заняли. Подскажите другой день или время?`
               );
             }
           }

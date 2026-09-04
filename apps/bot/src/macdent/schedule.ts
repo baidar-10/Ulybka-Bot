@@ -172,7 +172,11 @@ export class MacdentSchedule {
         doctor: doctorId,
         ...this.dateWhen(isoDate),
       });
-      const rows = extractBusyDateWindows(zapis, this.toZoned.bind(this));
+      const rows = extractBusyDateWindows(
+        zapis,
+        this.toZoned.bind(this),
+        Math.max(60, durationMinutes)
+      );
       busy = rows.map(({ starts_at, ends_at }) => ({ starts_at, ends_at }));
       raspId = raspId ?? rows.find((r) => r.raspId)?.raspId ?? null;
       const busyLabel = busy

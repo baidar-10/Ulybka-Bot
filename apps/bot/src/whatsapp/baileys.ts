@@ -14,11 +14,14 @@ import qrcode from "qrcode-terminal";
 import { env } from "../config/env.js";
 import type { DialogOrchestrator } from "../ai/orchestrator.js";
 import { normalizePhone } from "../booking/service.js";
+import { createDebouncedIngress, createPhoneQueue } from "./phone-queue.js";
 import type { WhatsAppProvider } from "./provider.js";
 
 export type { WhatsAppProvider } from "./provider.js";
 
 const waLogger = pino({ level: "silent" });
+const MAX_CONCURRENT_DIALOGS = 5;
+const MESSAGE_COALESCE_MS = 1200;
 
 export function createBaileysProvider(
   orchestrator: DialogOrchestrator
@@ -26,26 +29,46 @@ export function createBaileysProvider(
   let sock: WASocket | null = null;
   let stopping = false;
   const processing = new Set<string>();
+  const queue = createPhoneQueue({ maxConcurrent: MAX_CONCURRENT_DIALOGS });
+  const ingress = createDebouncedIngress<{ dedupeKey: string; jid: string }>({
+    queue,
+    delayMs: MESSAGE_COALESCE_MS,
+    combineTexts: (texts) => texts.join("\n").trim(),
+    async run({ phone, text, metas }) {
+      const jid = metas[metas.length - 1]?.jid;
+      try {
+        const reply = await orchestrator.handleMessage({ phone, text });
+        if (sock && jid) {
+          await sock.sendMessage(jid, { text: reply });
+        }
+      } catch (err) {
+        console.error("Failed to handle WhatsApp message", err);
+        if (sock && jid) {
+          try {
+            await sock.sendMessage(jid, {
+              text: "Произошла ошибка. Попробуйте ещё раз чуть позже.",
+            });
+          } catch {
+            /* ignore */
+          }
+        }
+      } finally {
+        for (const m of metas) {
+          processing.delete(m.dedupeKey);
+        }
+      }
+    },
+  });
 
-  async function handleIncoming(phone: string, text: string, jid: string) {
-    const key = `${phone}:${text}`;
-    if (processing.has(key)) return;
-    processing.add(key);
-    try {
-      const reply = await orchestrator.handleMessage({ phone, text });
-      if (sock) {
-        await sock.sendMessage(jid, { text: reply });
-      }
-    } catch (err) {
-      console.error("Failed to handle WhatsApp message", err);
-      if (sock) {
-        await sock.sendMessage(jid, {
-          text: "Произошла ошибка. Попробуйте ещё раз чуть позже.",
-        });
-      }
-    } finally {
-      processing.delete(key);
-    }
+  function enqueueIncoming(
+    phone: string,
+    text: string,
+    jid: string,
+    dedupeKey: string
+  ) {
+    if (processing.has(dedupeKey)) return;
+    processing.add(dedupeKey);
+    ingress.push(phone, text, { dedupeKey, jid });
   }
 
   async function connect(): Promise<void> {
@@ -111,7 +134,7 @@ export function createBaileysProvider(
       }
     });
 
-    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    sock.ev.on("messages.upsert", ({ messages, type }) => {
       if (type !== "notify") return;
       for (const msg of messages) {
         if (!msg.message || msg.key.fromMe) continue;
@@ -131,7 +154,9 @@ export function createBaileysProvider(
         const phone = normalizePhone(jid.split("@")[0] || "");
         if (!phone) continue;
 
-        await handleIncoming(phone, text, jid);
+        const dedupeKey =
+          msg.key.id != null ? `${phone}:${msg.key.id}` : `${phone}:${text}`;
+        enqueueIncoming(phone, text, jid, dedupeKey);
       }
     });
   }
@@ -143,6 +168,7 @@ export function createBaileysProvider(
     },
     async stop() {
       stopping = true;
+      await ingress.drain(5000);
       try {
         sock?.end(undefined);
       } catch {
